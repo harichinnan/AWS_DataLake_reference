@@ -1,0 +1,31 @@
+CREATE EXTERNAL TABLE IF NOT EXISTS "${database}"."${raw_table}" (
+  ride_id string,
+  rideable_type string,
+  started_at string,
+  ended_at string,
+  start_station_name string,
+  start_station_id string,
+  end_station_name string,
+  end_station_id string,
+  start_lat string,
+  start_lng string,
+  end_lat string,
+  end_lng string,
+  member_casual string
+)
+PARTITIONED BY (
+  year string,
+  month string
+)
+ROW FORMAT SERDE 'org.apache.hadoop.hive.serde2.OpenCSVSerde'
+WITH SERDEPROPERTIES (
+  'separatorChar' = ',',
+  'quoteChar' = '"',
+  'escapeChar' = '\\'
+)
+STORED AS TEXTFILE
+LOCATION '${raw_trips_s3_location}'
+TBLPROPERTIES (
+  'classification' = 'csv',
+  'skip.header.line.count' = '1'
+);

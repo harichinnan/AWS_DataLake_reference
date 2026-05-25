@@ -1,0 +1,101 @@
+version: 2
+
+sources:
+  - name: citibike_raw
+    description: Raw Citi Bike trip CSV data registered in Glue and queried through Athena.
+    database: awsdatacatalog
+    schema: citibike_lake_dev
+    tables:
+      - name: citibike_trips_raw
+        description: External CSV table over raw Citi Bike monthly trip files in S3.
+
+models:
+  - name: citibike_trips_silver
+    description: Typed, normalized, deduplicated Citi Bike trips in Iceberg format.
+    columns:
+      - name: ride_id
+        description: Citi Bike ride identifier.
+        tests:
+          - not_null
+          - unique
+      - name: started_at
+        tests:
+          - not_null
+      - name: ended_at
+        tests:
+          - not_null
+      - name: rideable_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['electric_bike', 'classic_bike']
+      - name: member_casual
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['member', 'casual']
+      - name: is_valid_duration
+        tests:
+          - not_null
+      - name: trip_date
+        tests:
+          - not_null
+      - name: source_year
+        tests:
+          - not_null
+      - name: source_month
+        tests:
+          - not_null
+
+  - name: citibike_trips_silver_observability
+    description: Daily observability metrics and quality status for the Silver Citi Bike trips table.
+    columns:
+      - name: trip_date
+        description: Observed trip date.
+        tests:
+          - not_null
+          - unique
+      - name: source_year
+        tests:
+          - not_null
+      - name: source_month
+        tests:
+          - not_null
+      - name: total_rides
+        tests:
+          - not_null
+      - name: duplicate_ride_ids
+        tests:
+          - not_null
+      - name: invalid_duration_rate
+        tests:
+          - not_null
+      - name: missing_station_rate
+        tests:
+          - not_null
+      - name: missing_geo_rate
+        tests:
+          - not_null
+      - name: quality_status
+        description: Daily quality result. Hard failures are selected by dbt/tests/silver_observability_no_failures.sql.
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['pass', 'warn', 'fail']
+
+  - name: citibike_daily_ridership_gold
+    description: Daily ridership metrics aggregated from the Silver trip table.
+    columns:
+      - name: trip_date
+        tests:
+          - not_null
+          - unique
+      - name: total_rides
+        tests:
+          - not_null
+      - name: refreshed_at
+        tests:
+          - not_null

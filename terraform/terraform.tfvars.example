@@ -1,0 +1,33 @@
+aws_region         = "us-east-1"
+allowed_account_id = "123456789012"
+
+project_name = "citibike-lake"
+environment  = "dev"
+
+# S3 bucket names are global. Set this if the default prefix is already taken
+# or if your organization has a naming standard.
+# bucket_name_prefix = "citibike-lake-dev-123456789012-us-east-1"
+
+# Keep false for non-disposable environments.
+force_destroy_buckets = false
+
+# Modern Citi Bike CSV schema months. For full historical backfills, prefer a
+# Glue or EMR Spark job because Lambda has a 15 minute runtime limit.
+citibike_months     = ["202601", "202602", "202603", "202604"]
+citibike_include_jc = false
+
+# Optional monthly schedule for the previous month.
+enable_monthly_ingestion_schedule = false
+
+# Optional BI deployment. Restrict this to your current IP or corporate CIDR.
+enable_metabase = false
+# metabase_allowed_cidr_blocks = ["203.0.113.10/32"]
+# metabase_admin_email         = "you@example.com"
+
+# Optional Lake Formation and Glue Data Quality governance.
+enable_lake_formation_governance = false
+enable_glue_data_quality         = false
+enable_glue_data_quality_event_observability = false
+# lake_formation_admin_principal_arns = [
+#   "arn:aws:iam::123456789012:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_xxxxxxxxxxxxxxxx"
+# ]

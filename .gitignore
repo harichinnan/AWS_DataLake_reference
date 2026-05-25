@@ -1,0 +1,44 @@
+# Terraform
+**/.terraform/
+.terraform-state/*
+!.terraform-state/.gitkeep
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan*
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Terraform variables — keep the example, ignore real values
+*.tfvars
+*.tfvars.json
+!*.tfvars.example
+
+# Build artifacts
+build/*
+!build/.gitkeep
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.venv-*/
+venv/
+
+# dbt
+dbt/logs/
+dbt/target/
+dbt/dbt_packages/
+dbt/.user.yml
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

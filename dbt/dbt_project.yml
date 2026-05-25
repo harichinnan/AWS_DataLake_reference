@@ -1,0 +1,40 @@
+name: citibike_lake
+version: 1.0.0
+config-version: 2
+
+profile: citibike_lake
+
+model-paths:
+  - models
+test-paths:
+  - tests
+macro-paths:
+  - macros
+
+target-path: target
+clean-targets:
+  - target
+  - dbt_packages
+
+vars:
+  citibike_start_year: "2026"
+  citibike_start_date: "2026-01-01"
+  silver_observability_min_daily_rides: 1000
+  silver_observability_warn_invalid_duration_rate: 0.005
+  silver_observability_fail_invalid_duration_rate: 0.02
+  silver_observability_warn_missing_station_rate: 0.10
+  silver_observability_fail_missing_station_rate: 0.25
+  silver_observability_warn_missing_geo_rate: 0.02
+  silver_observability_fail_missing_geo_rate: 0.10
+
+models:
+  citibike_lake:
+    +table_type: iceberg
+    +format: parquet
+    +write_compression: snappy
+    silver:
+      +tags:
+        - silver
+    gold:
+      +tags:
+        - gold

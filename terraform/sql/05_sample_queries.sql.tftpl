@@ -1,0 +1,10 @@
+SELECT
+  trip_date,
+  count(*) AS rides,
+  approx_percentile(duration_seconds, 0.5) AS median_duration_seconds,
+  count_if(rideable_type = 'electric_bike') AS electric_bike_rides,
+  count_if(member_casual = 'member') AS member_rides,
+  count_if(member_casual = 'casual') AS casual_rides
+FROM "${database}"."${iceberg_table}"
+GROUP BY trip_date
+ORDER BY trip_date;

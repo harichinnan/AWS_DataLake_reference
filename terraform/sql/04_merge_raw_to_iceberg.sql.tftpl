@@ -1,0 +1,92 @@
+MERGE INTO "${database}"."${iceberg_table}" AS target
+USING (
+  SELECT
+    ride_id,
+    rideable_type,
+    started_ts AS started_at,
+    ended_ts AS ended_at,
+    date_diff('second', started_ts, ended_ts) AS duration_seconds,
+    start_station_name,
+    start_station_id,
+    end_station_name,
+    end_station_id,
+    try_cast(start_lat AS double) AS start_lat,
+    try_cast(start_lng AS double) AS start_lng,
+    try_cast(end_lat AS double) AS end_lat,
+    try_cast(end_lng AS double) AS end_lng,
+    member_casual,
+    cast(started_ts AS date) AS trip_date,
+    year AS source_year,
+    month AS source_month
+  FROM (
+    SELECT
+      *,
+      try_cast(started_at AS timestamp) AS started_ts,
+      try_cast(ended_at AS timestamp) AS ended_ts,
+      row_number() OVER (
+        PARTITION BY ride_id
+        ORDER BY try_cast(started_at AS timestamp) DESC
+      ) AS ride_row_number
+    FROM "${database}"."${raw_table}"
+    WHERE ride_id IS NOT NULL
+      AND trim(ride_id) <> ''
+  ) typed
+  WHERE ride_row_number = 1
+    AND started_ts IS NOT NULL
+    AND ended_ts IS NOT NULL
+) AS source
+ON target.ride_id = source.ride_id
+WHEN MATCHED THEN UPDATE SET
+  rideable_type = source.rideable_type,
+  started_at = source.started_at,
+  ended_at = source.ended_at,
+  duration_seconds = source.duration_seconds,
+  start_station_name = source.start_station_name,
+  start_station_id = source.start_station_id,
+  end_station_name = source.end_station_name,
+  end_station_id = source.end_station_id,
+  start_lat = source.start_lat,
+  start_lng = source.start_lng,
+  end_lat = source.end_lat,
+  end_lng = source.end_lng,
+  member_casual = source.member_casual,
+  trip_date = source.trip_date,
+  source_year = source.source_year,
+  source_month = source.source_month
+WHEN NOT MATCHED THEN INSERT (
+  ride_id,
+  rideable_type,
+  started_at,
+  ended_at,
+  duration_seconds,
+  start_station_name,
+  start_station_id,
+  end_station_name,
+  end_station_id,
+  start_lat,
+  start_lng,
+  end_lat,
+  end_lng,
+  member_casual,
+  trip_date,
+  source_year,
+  source_month
+) VALUES (
+  source.ride_id,
+  source.rideable_type,
+  source.started_at,
+  source.ended_at,
+  source.duration_seconds,
+  source.start_station_name,
+  source.start_station_id,
+  source.end_station_name,
+  source.end_station_id,
+  source.start_lat,
+  source.start_lng,
+  source.end_lat,
+  source.end_lng,
+  source.member_casual,
+  source.trip_date,
+  source.source_year,
+  source.source_month
+);

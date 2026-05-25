@@ -1,0 +1,16 @@
+citibike_lake:
+  target: dev
+  outputs:
+    dev:
+      type: athena
+      database: awsdatacatalog
+      schema: citibike_lake_dev
+      region_name: us-east-1
+      work_group: citibike-lake-dev-wg
+      s3_staging_dir: s3://citibike-lake-dev-452167573733-us-east-1-athena-results/dbt/
+      s3_data_dir: s3://citibike-lake-dev-452167573733-us-east-1-warehouse/warehouse/citibike/iceberg/dbt/
+      s3_data_naming: schema_table_unique
+      aws_profile_name: "{{ env_var('AWS_PROFILE', 'citibike-lake-dev') }}"
+      threads: 4
+      num_retries: 3
+      poll_interval: 2

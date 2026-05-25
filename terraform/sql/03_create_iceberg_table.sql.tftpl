@@ -1,0 +1,28 @@
+CREATE TABLE IF NOT EXISTS "${database}"."${iceberg_table}" (
+  ride_id string,
+  rideable_type string,
+  started_at timestamp,
+  ended_at timestamp,
+  duration_seconds bigint,
+  start_station_name string,
+  start_station_id string,
+  end_station_name string,
+  end_station_id string,
+  start_lat double,
+  start_lng double,
+  end_lat double,
+  end_lng double,
+  member_casual string,
+  trip_date date,
+  source_year string,
+  source_month string
+)
+PARTITIONED BY (
+  month(started_at)
+)
+LOCATION '${iceberg_trips_s3_location}'
+TBLPROPERTIES (
+  'table_type' = 'ICEBERG',
+  'format' = 'parquet',
+  'write_compression' = 'snappy'
+);
