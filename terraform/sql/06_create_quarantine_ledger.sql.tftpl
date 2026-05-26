@@ -1,0 +1,15 @@
+create table if not exists ${database_name}.${quarantine_table_name} (
+  source_year     varchar,
+  source_month    varchar,
+  quarantined_at  timestamp,
+  cleared_at      timestamp,
+  run_id          varchar,
+  result_id       varchar,
+  rules_failed    array<varchar>,
+  notes           varchar
+)
+location '${quarantine_table_s3_location}'
+tblproperties (
+  'table_type' = 'ICEBERG',
+  'format'     = 'parquet'
+)

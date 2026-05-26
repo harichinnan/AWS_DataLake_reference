@@ -132,3 +132,8 @@ output "glue_dq_rule_results_table_name" {
   description = "Athena table name for normalized Glue Data Quality rule-level results."
   value       = local.glue_dq_rule_results_table_name
 }
+
+output "citibike_data_alerts_topic_arn" {
+  description = "SNS topic ARN that receives Glue DQ failures and pipeline alerts."
+  value       = aws_sns_topic.citibike_data_alerts.arn
+}

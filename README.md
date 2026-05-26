@@ -216,6 +216,44 @@ group by event_date, rule_result
 order by event_date desc, rule_result;
 ```
 
+## Resilient Auto-Heal Pipeline
+
+Set `enable_pipeline_orchestration = true` to stand up the Step Functions–driven auto-heal stack on top of the manual workflow. Terraform builds:
+
+- A dedicated VPC + AWS Batch Fargate compute environment running a dbt-athena container (image pushed to ECR at apply time — requires `docker buildx` locally)
+- An Iceberg ledger `citibike_quarantined_partitions` that records (year, month) partitions failing Glue Data Quality
+- A Step Functions state machine that chains: clear stale quarantine → ingest → Athena `MSCK REPAIR` → dbt build Silver → start Glue DQ + poll → on FAIL insert quarantine row + dbt refilter + SNS alert, on PASS dbt build Gold
+- An EventBridge → Lambda trigger on raw S3 `ObjectCreated` events that starts the state machine for the (year, month) extracted from the key
+- A daily cron safety-net rule (configurable via `pipeline_schedule_expression`)
+- An SNS topic (`citibike-lake-dev-data-alerts`) with optional email + Slack subscriptions and a parallel EventBridge rule that publishes any Glue DQ failure
+
+```bash
+# Once enabled, drop a corrected month at the same S3 key:
+aws s3 cp 202602-citibike-tripdata-fixed.csv \
+  "s3://$(terraform -chdir=terraform output -raw s3_buckets | jq -r .raw)/raw/citibike/trips/year=2026/month=02/citibike_202602-citibike-tripdata.csv"
+
+# Watch the state machine self-heal:
+aws stepfunctions list-executions \
+  --state-machine-arn "$(terraform -chdir=terraform output -raw pipeline_state_machine_arn)" \
+  --max-items 5
+```
+
+The auto-heal contract: Silver and Gold both use full-scan MERGE with no `is_incremental()` watermark, so corrected `ride_id`s overwrite Silver and the daily Gold aggregation recomputes affected `trip_date`s every run. The orchestrator's job is to fire the chain on data changes, gate Gold on DQ pass, alert on failures, and quarantine the offending (year, month) so Gold never reflects bad data.
+
+Required variables when `enable_pipeline_orchestration = true`:
+
+```hcl
+enable_pipeline_orchestration = true
+enable_glue_data_quality      = true   # already on by default
+alert_email                   = "you@example.com"
+# alert_slack_webhook_url     = "https://hooks.slack.com/..."
+# pipeline_schedule_expression = "cron(0 6 * * ? *)"
+# dbt_batch_vcpu              = 1
+# dbt_batch_memory_mb         = 2048
+```
+
+The first apply pushes a docker image to a new ECR repo. Allow ~2-3 minutes for the build step.
+
 ## Lake Formation Governance
 
 When `enable_lake_formation_governance = true`, Terraform moves data lake governance to Lake Formation for the raw and warehouse S3 buckets:

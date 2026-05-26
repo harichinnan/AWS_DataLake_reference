@@ -14,3 +14,17 @@ citibike_lake:
       threads: 4
       num_retries: 3
       poll_interval: 2
+
+    # Used by the AWS Batch dbt runner. Credentials come from the task role, so aws_profile_name is omitted.
+    prod:
+      type: athena
+      database: awsdatacatalog
+      schema: "{{ env_var('DBT_ATHENA_SCHEMA', 'citibike_lake_dev') }}"
+      region_name: "{{ env_var('AWS_REGION', 'us-east-1') }}"
+      work_group: "{{ env_var('DBT_ATHENA_WORKGROUP', 'citibike-lake-dev-wg') }}"
+      s3_staging_dir: "{{ env_var('DBT_ATHENA_STAGING_DIR') }}"
+      s3_data_dir: "{{ env_var('DBT_ATHENA_DATA_DIR') }}"
+      s3_data_naming: schema_table_unique
+      threads: 4
+      num_retries: 3
+      poll_interval: 2

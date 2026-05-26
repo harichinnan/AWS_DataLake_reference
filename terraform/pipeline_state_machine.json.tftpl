@@ -1,0 +1,265 @@
+{
+  "Comment": "Citi Bike data pipeline. Ingests one (year, month), refreshes Silver, runs Glue DQ, quarantines on failure, refreshes Gold on success.",
+  "StartAt": "ParseInput",
+  "States": {
+    "ParseInput": {
+      "Type": "Pass",
+      "Parameters": {
+        "year.$": "$.year",
+        "month.$": "$.month",
+        "include_jc.$": "$.include_jc",
+        "trigger_source.$": "$.trigger_source",
+        "months_payload.$": "States.Array(States.Format('{}{}', $.year, $.month))"
+      },
+      "ResultPath": "$.normalized",
+      "Next": "ClearStaleQuarantine"
+    },
+
+    "ClearStaleQuarantine": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "WorkGroup": "${athena_workgroup}",
+        "QueryString.$": "States.Format('UPDATE ${database}.${quarantine_table} SET cleared_at = current_timestamp WHERE source_year = ''{}'' AND source_month = ''{}'' AND cleared_at IS NULL', $.normalized.year, $.normalized.month)",
+        "QueryExecutionContext": { "Database": "${database}" },
+        "ResultConfiguration": { "OutputLocation": "${athena_results_state_machine_dir}" }
+      },
+      "ResultPath": "$.clearQuarantine",
+      "Next": "InvokeIngest",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "InvokeIngest": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ingest_lambda_arn}",
+        "Payload": {
+          "months.$": "$.normalized.months_payload",
+          "include_jc.$": "$.normalized.include_jc"
+        }
+      },
+      "ResultPath": "$.ingest",
+      "Next": "RunMsckRepair",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "RunMsckRepair": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "WorkGroup": "${athena_workgroup}",
+        "QueryString": "MSCK REPAIR TABLE ${database}.citibike_trips_raw",
+        "QueryExecutionContext": { "Database": "${database}" },
+        "ResultConfiguration": { "OutputLocation": "${athena_results_state_machine_dir}" }
+      },
+      "ResultPath": "$.repair",
+      "Next": "RunDbtSilver",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "RunDbtSilver": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Parameters": {
+        "JobName": "dbt-silver",
+        "JobDefinition": "${dbt_job_definition_arn}",
+        "JobQueue": "${dbt_job_queue_arn}",
+        "ContainerOverrides": {
+          "Environment": [
+            { "Name": "DBT_COMMAND", "Value": "build" },
+            { "Name": "DBT_SELECT", "Value": "citibike_quarantine_filter+ citibike_trips_silver+ silver_observability_no_failures" }
+          ]
+        }
+      },
+      "ResultPath": "$.dbtSilver",
+      "Next": "StartGlueDQ",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "StartGlueDQ": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:startDataQualityRulesetEvaluationRun",
+      "Parameters": {
+        "DataSource": {
+          "GlueTable": {
+            "DatabaseName": "${database}",
+            "TableName": "citibike_trips_silver"
+          }
+        },
+        "Role": "${glue_dq_role_arn}",
+        "NumberOfWorkers": ${glue_dq_workers},
+        "Timeout": ${glue_dq_timeout_minutes},
+        "RulesetNames": ["${dq_ruleset_name}"],
+        "AdditionalRunOptions": {
+          "CloudWatchMetricsEnabled": true,
+          "ResultsS3Prefix": "${glue_dq_results_prefix}"
+        }
+      },
+      "ResultPath": "$.dq",
+      "Next": "WaitForGlueDQ",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "WaitForGlueDQ": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "GetGlueDQStatus"
+    },
+
+    "GetGlueDQStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getDataQualityRulesetEvaluationRun",
+      "Parameters": {
+        "RunId.$": "$.dq.RunId"
+      },
+      "ResultPath": "$.dqStatus",
+      "Next": "GlueDQTerminal?",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "GlueDQTerminal?": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.dqStatus.Status", "StringEquals": "SUCCEEDED", "Next": "GetGlueDQResult" },
+        { "Variable": "$.dqStatus.Status", "StringEquals": "FAILED",    "Next": "QuarantinePartition" },
+        { "Variable": "$.dqStatus.Status", "StringEquals": "STOPPED",   "Next": "QuarantinePartition" },
+        { "Variable": "$.dqStatus.Status", "StringEquals": "TIMEOUT",   "Next": "QuarantinePartition" }
+      ],
+      "Default": "WaitForGlueDQ"
+    },
+
+    "GetGlueDQResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getDataQualityResult",
+      "Parameters": {
+        "ResultId.$": "States.ArrayGetItem($.dqStatus.ResultIds, 0)"
+      },
+      "ResultPath": "$.dqResult",
+      "Next": "DQPassed?",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "DQPassed?": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.dqResult.RuleResults[0].Result", "IsPresent": true }
+          ],
+          "Next": "EvaluateRuleResults"
+        }
+      ],
+      "Default": "QuarantinePartition"
+    },
+
+    "EvaluateRuleResults": {
+      "Type": "Pass",
+      "Parameters": {
+        "anyFailures.$": "States.ArrayContains($.dqResult.RuleResults[*].Result, 'FAIL')"
+      },
+      "ResultPath": "$.dqResultSummary",
+      "Next": "AnyRuleFailed?"
+    },
+
+    "AnyRuleFailed?": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.dqResultSummary.anyFailures", "BooleanEquals": true, "Next": "QuarantinePartition" }
+      ],
+      "Default": "RunDbtGold"
+    },
+
+    "QuarantinePartition": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "WorkGroup": "${athena_workgroup}",
+        "QueryString.$": "States.Format('INSERT INTO ${database}.${quarantine_table} (source_year, source_month, quarantined_at, cleared_at, run_id, result_id, rules_failed, notes) VALUES (''{}'', ''{}'', current_timestamp, NULL, ''{}'', ''{}'', ARRAY[], ''Glue DQ failure'')', $.normalized.year, $.normalized.month, $.dq.RunId, States.ArrayGetItem($.dqStatus.ResultIds, 0))",
+        "QueryExecutionContext": { "Database": "${database}" },
+        "ResultConfiguration": { "OutputLocation": "${athena_results_state_machine_dir}" }
+      },
+      "ResultPath": "$.quarantineWrite",
+      "Next": "RunDbtSilverRefilter",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "RunDbtSilverRefilter": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Parameters": {
+        "JobName": "dbt-silver-quarantine-refilter",
+        "JobDefinition": "${dbt_job_definition_arn}",
+        "JobQueue": "${dbt_job_queue_arn}",
+        "ContainerOverrides": {
+          "Environment": [
+            { "Name": "DBT_COMMAND", "Value": "run" },
+            { "Name": "DBT_SELECT", "Value": "citibike_quarantine_filter+ citibike_trips_silver" }
+          ]
+        }
+      },
+      "ResultPath": "$.dbtSilverRefilter",
+      "Next": "PublishDQFailure",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "PublishDQFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${alerts_topic_arn}",
+        "Subject": "Citi Bike pipeline quarantined a partition",
+        "Message.$": "States.Format('Glue DQ failed for citibike_trips_silver. Quarantined partition year={} month={}. ResultId={}. Investigate citibike_glue_dq_rule_results.', $.normalized.year, $.normalized.month, States.ArrayGetItem($.dqStatus.ResultIds, 0))"
+      },
+      "ResultPath": "$.alertPublished",
+      "Next": "DQFailed"
+    },
+
+    "DQFailed": {
+      "Type": "Fail",
+      "Error": "GlueDataQualityFailure",
+      "Cause": "Glue DQ rules failed; partition quarantined and Silver refiltered."
+    },
+
+    "RunDbtGold": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::batch:submitJob.sync",
+      "Parameters": {
+        "JobName": "dbt-gold",
+        "JobDefinition": "${dbt_job_definition_arn}",
+        "JobQueue": "${dbt_job_queue_arn}",
+        "ContainerOverrides": {
+          "Environment": [
+            { "Name": "DBT_COMMAND", "Value": "build" },
+            { "Name": "DBT_SELECT", "Value": "citibike_daily_ridership_gold+ citibike_daily_dq_status_gold gold_only_for_dq_passing_data" }
+          ]
+        }
+      },
+      "ResultPath": "$.dbtGold",
+      "Next": "Succeeded",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "PipelineFailure" }]
+    },
+
+    "Succeeded": {
+      "Type": "Succeed"
+    },
+
+    "PipelineFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${alerts_topic_arn}",
+        "Subject": "Citi Bike pipeline failed",
+        "Message.$": "States.Format('Pipeline failure during run. Error: {}', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.alertPublished",
+      "Next": "PipelineFailed"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineFailure",
+      "Cause": "Pipeline step failed; alert published to SNS."
+    }
+  }
+}

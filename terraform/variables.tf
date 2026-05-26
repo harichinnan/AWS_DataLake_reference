@@ -352,6 +352,61 @@ variable "glue_data_quality_event_processor_log_retention_days" {
   }
 }
 
+variable "alert_email" {
+  description = "Email address subscribed to the data alerts SNS topic. Empty disables the email subscription."
+  type        = string
+  default     = ""
+}
+
+variable "enable_pipeline_orchestration" {
+  description = "If true, creates the AWS Batch dbt runner, Step Functions pipeline, and S3/cron triggers that orchestrate the auto-heal flow."
+  type        = bool
+  default     = false
+}
+
+variable "dbt_runner_vpc_cidr" {
+  description = "CIDR block for the dedicated VPC used by the Batch dbt runner."
+  type        = string
+  default     = "10.42.0.0/16"
+}
+
+variable "dbt_runner_image_tag" {
+  description = "Image tag pushed to the dbt-runner ECR repository (typically 'latest' or a release SHA)."
+  type        = string
+  default     = "latest"
+}
+
+variable "dbt_batch_vcpu" {
+  description = "Fargate vCPU allocated to each dbt Batch job."
+  type        = number
+  default     = 1
+}
+
+variable "dbt_batch_memory_mb" {
+  description = "Fargate memory (MB) allocated to each dbt Batch job. Must be a valid Fargate vCPU/memory combination."
+  type        = number
+  default     = 2048
+}
+
+variable "dbt_batch_max_vcpus" {
+  description = "Maximum vCPUs the dbt Batch compute environment will scale to."
+  type        = number
+  default     = 8
+}
+
+variable "pipeline_schedule_expression" {
+  description = "EventBridge schedule expression for the daily safety-net pipeline run. Set empty to disable the cron."
+  type        = string
+  default     = "cron(0 6 * * ? *)"
+}
+
+variable "alert_slack_webhook_url" {
+  description = "Optional Slack incoming webhook URL subscribed to the data alerts SNS topic. Empty disables Slack."
+  type        = string
+  default     = ""
+  sensitive   = true
+}
+
 variable "tags" {
   description = "Additional tags applied to supported AWS resources."
   type        = map(string)

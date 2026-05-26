@@ -1,0 +1,15 @@
+.git
+.venv-dbt
+.terraform
+.terraform-state
+.terraform.lock.hcl
+build
+dbt/logs
+dbt/target
+dbt/dbt_packages
+dbt/.user.yml
+terraform
+scripts
+src/lambda/__pycache__
+README.md
+CLAUDE.md

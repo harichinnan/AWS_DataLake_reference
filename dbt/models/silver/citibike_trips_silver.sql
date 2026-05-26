@@ -8,7 +8,10 @@
     on_schema_change='sync_all_columns',
     table_properties={
       'optimize_rewrite_delete_file_threshold': '2'
-    }
+    },
+    post_hook=[
+      "delete from {{ this }} where (source_year, source_month) in (select source_year, source_month from {{ ref('citibike_quarantine_filter') }})"
+    ]
   )
 }}
 
@@ -34,6 +37,9 @@ with typed as (
     and trim(ride_id) <> ''
     and year >= '{{ var("citibike_start_year", "2026") }}'
     and date(try_cast(started_at as timestamp)) >= date '{{ var("citibike_start_date", "2026-01-01") }}'
+    and (year, month) not in (
+      select source_year, source_month from {{ ref('citibike_quarantine_filter') }}
+    )
 ),
 
 ranked as (

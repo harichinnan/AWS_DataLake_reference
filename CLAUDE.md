@@ -11,6 +11,7 @@ A small but complete AWS data lake reference built on Citi Bike trip data. Demon
 | 3. Transformation (Medallion) | **dbt** on Athena Iceberg | [dbt/](dbt/) |
 | 4. BI / Visualization | **Metabase** on ECS Fargate + RDS | [terraform/metabase.tf](terraform/metabase.tf), [scripts/setup_metabase.py](scripts/setup_metabase.py) |
 | 5. Observability | **EventBridge → Step Functions → Lambda → Athena** | [terraform/data_quality_events.tf](terraform/data_quality_events.tf), [src/lambda/process_glue_dq_event.py](src/lambda/process_glue_dq_event.py) |
+| 6. Resilience (opt-in) | **AWS Batch (Fargate) dbt runner + Step Functions auto-heal pipeline + SNS alerts** | [terraform/dbt_runner.tf](terraform/dbt_runner.tf), [terraform/pipeline.tf](terraform/pipeline.tf), [terraform/triggers.tf](terraform/triggers.tf), [terraform/alerts.tf](terraform/alerts.tf), [terraform/quarantine.tf](terraform/quarantine.tf) |
 
 Storage is S3 with Glue Data Catalog. Compute is Athena (engine v3) for SQL and Lambda for ingest + DQ event processing. Quality is declarative via Glue Data Quality DQDL.
 
@@ -37,6 +38,45 @@ citibike_daily_ridership_gold                          ← Silver→Gold
 ```
 
 Parallel to dbt, a Glue Data Quality DQDL ruleset evaluates the Silver Iceberg table. Result events fan out through EventBridge → Step Functions → Lambda, which writes flattened JSONL to S3, surfaced as Athena partition-projected tables (`citibike_glue_dq_run_events`, `citibike_glue_dq_rule_results`).
+
+## Resilience and Auto-Heal (enable_pipeline_orchestration)
+
+When `var.enable_pipeline_orchestration = true`, an additional Step Functions–driven layer wraps the whole pipeline:
+
+```
+S3 ObjectCreated (raw/citibike/trips/year=YYYY/month=MM/*)
+       │             ┌────────── daily cron safety net ──────────┐
+       └─→ EventBridge ─→ pipeline_kicker Lambda ─→ Step Functions ↩
+                                                       │
+                          ┌────────────────────────────┴────────────────────────────┐
+                          │ ParseInput → ClearStaleQuarantine (Athena UPDATE)       │
+                          │ → InvokeIngest (Lambda)                                  │
+                          │ → MSCK Repair (Athena .sync)                             │
+                          │ → dbt build silver+ (Batch Fargate .sync)                │
+                          │ → Start Glue DQ + poll until terminal                    │
+                          │ → Choice:                                                │
+                          │     PASS → dbt build gold+ → Succeed                     │
+                          │     FAIL → INSERT INTO quarantine ledger                 │
+                          │             → dbt run silver (refilter, post-hook DELETE)│
+                          │             → SNS alert → Fail                           │
+                          └─────────────────────────────────────────────────────────┘
+```
+
+The auto-heal contract: drop a corrected month file at the same S3 key. S3 EventBridge fires. The state machine clears the stale quarantine row first, re-ingests, rebuilds Silver (full-scan MERGE on `ride_id` overwrites the bad rows), re-evaluates Glue DQ, and if green, rebuilds Gold (full-scan recompute on `trip_date` heals affected aggregates). No human intervention required.
+
+### Components added by the resilience layer
+
+| Component | File |
+|---|---|
+| SNS topic + email/Slack subscriptions + DQ-failure EventBridge rule | [terraform/alerts.tf](terraform/alerts.tf) |
+| Quarantine Iceberg ledger (`citibike_quarantined_partitions`) + Athena DDL + bootstrap | [terraform/quarantine.tf](terraform/quarantine.tf), [terraform/sql/06_create_quarantine_ledger.sql.tftpl](terraform/sql/06_create_quarantine_ledger.sql.tftpl) |
+| dbt sources for DQ events + quarantine | [dbt/models/sources.yml](dbt/models/sources.yml) |
+| Silver anti-join + post-hook DELETE on quarantined partitions | [dbt/models/silver/citibike_trips_silver.sql](dbt/models/silver/citibike_trips_silver.sql), [dbt/models/silver/citibike_quarantine_filter.sql](dbt/models/silver/citibike_quarantine_filter.sql) |
+| Gold DQ-status view consumed by Metabase | [dbt/models/gold/citibike_daily_dq_status_gold.sql](dbt/models/gold/citibike_daily_dq_status_gold.sql) |
+| Singular test gating Gold on DQ pass | [dbt/tests/gold_only_for_dq_passing_data.sql](dbt/tests/gold_only_for_dq_passing_data.sql) |
+| AWS Batch Fargate dbt runner + ECR image | [terraform/dbt_runner.tf](terraform/dbt_runner.tf), [docker/dbt-runner/](docker/dbt-runner/) |
+| Step Functions state machine + IAM | [terraform/pipeline.tf](terraform/pipeline.tf), [terraform/pipeline_state_machine.json.tftpl](terraform/pipeline_state_machine.json.tftpl) |
+| Triggers (S3 EventBridge + daily cron + kicker Lambda) | [terraform/triggers.tf](terraform/triggers.tf), [src/lambda/pipeline_kicker.py](src/lambda/pipeline_kicker.py) |
 
 ## Project Layout
 
@@ -82,7 +122,11 @@ Parallel to dbt, a Glue Data Quality DQDL ruleset evaluates the Silver Iceberg t
 | `enable_glue_data_quality_event_observability` | true | Wires up the EventBridge → Step Functions → Lambda → Athena observability path |
 | `enable_lake_formation_governance` | true | Registers raw + warehouse buckets, creates LF data access role, switches grants from `IAM_ALLOWED_PRINCIPALS` to explicit LF grants |
 | `enable_metabase` | true | Stands up the Metabase ECS service + RDS |
-| `enable_monthly_ingestion` | false | Creates an EventBridge schedule to invoke the ingest Lambda monthly |
+| `enable_monthly_ingestion_schedule` | false | Creates an EventBridge schedule to invoke the ingest Lambda monthly (bypasses the orchestrator) |
+| `enable_pipeline_orchestration` | false | Builds the AWS Batch dbt runner, Step Functions auto-heal pipeline, S3 + cron triggers, and quarantine ledger |
+| `alert_email` | `""` | Email subscribed to the data alerts SNS topic; empty disables email |
+| `alert_slack_webhook_url` | `""` | Slack incoming webhook subscribed to the SNS topic; empty disables Slack |
+| `pipeline_schedule_expression` | `"cron(0 6 * * ? *)"` | Daily safety-net cron for the orchestrator; empty disables |
 
 Toggle these to scope the deployment to just the pillars you want to study.
 
@@ -125,6 +169,9 @@ AWS_PROFILE=citibike-lake-dev python3 scripts/setup_metabase.py
 - **`citibike_glue_dq_run_events` and `citibike_glue_dq_rule_results` are partition-projected.** No crawler or `MSCK REPAIR TABLE` needed.
 - **Metabase ALB is HTTP-only and CIDR-restricted via `metabase_allowed_cidr_blocks`.** For real use, add ACM + HTTPS + SSO.
 - **Apple Silicon + Intel Homebrew is a trap.** The AWS provider plugin (~900 MB) crashes Rosetta with a JIT assertion. Install terraform from ARM Homebrew at `/opt/homebrew/` via `brew install hashicorp/tap/terraform`.
+- **`enable_pipeline_orchestration = true` adds two host dependencies at apply time:** the `aws` CLI (used by [terraform/quarantine.tf](terraform/quarantine.tf) to bootstrap the Iceberg ledger via Athena) and `docker buildx` (used by [terraform/dbt_runner.tf](terraform/dbt_runner.tf) to build + push the dbt-runner image to ECR). On Apple Silicon both must be functional — the image is forced to `linux/amd64` to match Fargate.
+- **Silver and Gold already auto-heal on corrected re-ingest.** Both dbt models use full-scan MERGE with no `is_incremental()` watermark — corrected `ride_id`s overwrite Silver, and the Gold aggregation recomputes all `trip_date`s every run. The resilience layer adds the *trigger, quarantine, and feedback loop* around these models, not the heal mechanic itself.
+- **Quarantine is a logical filter, not a physical move.** The ledger entry causes Silver's `where` clause to skip the bad partition; a post-hook `DELETE FROM citibike_trips_silver WHERE (source_year, source_month) IN (quarantine)` removes any previously-merged rows. Once corrected data is re-ingested, Step Functions clears the ledger row (`cleared_at = now()`) and Silver re-includes the partition.
 
 ## Reference Material
 

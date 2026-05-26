@@ -9,6 +9,21 @@ sources:
       - name: citibike_trips_raw
         description: External CSV table over raw Citi Bike monthly trip files in S3.
 
+  - name: citibike_observability
+    description: Glue Data Quality events and the partition quarantine ledger, all surfaced as Athena tables.
+    database: awsdatacatalog
+    schema: citibike_lake_dev
+    tables:
+      - name: citibike_glue_dq_run_events
+        description: Run-level Glue Data Quality results captured by EventBridge and Step Functions.
+      - name: citibike_glue_dq_rule_results
+        description: Rule-level Glue Data Quality results emitted per evaluation run.
+      - name: citibike_quarantined_partitions
+        description: |
+          Iceberg ledger of raw (source_year, source_month) partitions that failed Glue Data Quality.
+          Inserted by the Step Functions orchestrator on a DQ failure and cleared on the next successful
+          ingest+DQ pass. Active row = cleared_at IS NULL.
+
 models:
   - name: citibike_trips_silver
     description: Typed, normalized, deduplicated Citi Bike trips in Iceberg format.
@@ -99,3 +114,20 @@ models:
       - name: refreshed_at
         tests:
           - not_null
+
+  - name: citibike_daily_dq_status_gold
+    description: |
+      Per-trip-date join of Gold ridership with the latest Glue Data Quality run status.
+      Powers the Metabase data-health tile and is the feed for the gold_only_for_dq_passing_data
+      singular test that gates Gold on DQ.
+    columns:
+      - name: trip_date
+        tests:
+          - not_null
+          - unique
+      - name: latest_dq_state
+        description: State of the most recent Glue DQ run on citibike_trips_silver (SUCCEEDED / FAILED / etc.).
+      - name: latest_dq_passed
+        description: True only when latest_dq_state = 'SUCCEEDED' and rules_failed = 0.
+      - name: latest_dq_failing_rule_names
+        description: Names of rules that did not return PASS in the latest run.
