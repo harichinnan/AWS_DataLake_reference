@@ -20,7 +20,7 @@
       "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
       "Parameters": {
         "WorkGroup": "${athena_workgroup}",
-        "QueryString.$": "States.Format('UPDATE ${database}.${quarantine_table} SET cleared_at = current_timestamp WHERE source_year = ''{}'' AND source_month = ''{}'' AND cleared_at IS NULL', $.normalized.year, $.normalized.month)",
+        "QueryString.$": "States.Format('UPDATE ${database}.${quarantine_table} SET cleared_at = current_timestamp WHERE source_year = \\'{}\\' AND source_month = \\'{}\\' AND cleared_at IS NULL', $.normalized.year, $.normalized.month)",
         "QueryExecutionContext": { "Database": "${database}" },
         "ResultConfiguration": { "OutputLocation": "${athena_results_state_machine_dir}" }
       },
@@ -175,7 +175,7 @@
       "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
       "Parameters": {
         "WorkGroup": "${athena_workgroup}",
-        "QueryString.$": "States.Format('INSERT INTO ${database}.${quarantine_table} (source_year, source_month, quarantined_at, cleared_at, run_id, result_id, rules_failed, notes) VALUES (''{}'', ''{}'', current_timestamp, NULL, ''{}'', ''{}'', ARRAY[], ''Glue DQ failure'')', $.normalized.year, $.normalized.month, $.dq.RunId, States.ArrayGetItem($.dqStatus.ResultIds, 0))",
+        "QueryString.$": "States.Format('INSERT INTO ${database}.${quarantine_table} (source_year, source_month, quarantined_at, run_id, result_id, notes) VALUES (\\'{}\\', \\'{}\\', current_timestamp, \\'{}\\', \\'{}\\', \\'Glue DQ failure\\')', $.normalized.year, $.normalized.month, $.dq.RunId, States.ArrayGetItem($.dqStatus.ResultIds, 0))",
         "QueryExecutionContext": { "Database": "${database}" },
         "ResultConfiguration": { "OutputLocation": "${athena_results_state_machine_dir}" }
       },
