@@ -1,12 +1,12 @@
 create table if not exists ${database_name}.${quarantine_table_name} (
-  source_year     varchar,
-  source_month    varchar,
+  source_year     string,
+  source_month    string,
   quarantined_at  timestamp,
   cleared_at      timestamp,
-  run_id          varchar,
-  result_id       varchar,
-  rules_failed    array<varchar>,
-  notes           varchar
+  run_id          string,
+  result_id       string,
+  rules_failed    array<string>,
+  notes           string
 )
 location '${quarantine_table_s3_location}'
 tblproperties (
