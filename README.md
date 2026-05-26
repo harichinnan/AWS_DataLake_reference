@@ -322,10 +322,11 @@ aws lambda invoke \
 
 The repo separates **DevOps** (infrastructure) from **pipeline code** (transformation logic, quality rules, Lambda business logic). Each lifecycle has its own GitHub Actions workflow under [.github/workflows/](.github/workflows/), and a [.github/CODEOWNERS](.github/CODEOWNERS) file routes PR review to the right team by path.
 
-Two IAM roles trust the GitHub OIDC provider (no long-lived secrets):
+Three IAM roles trust the GitHub OIDC provider (no long-lived secrets):
 
-- **`citibike-lake-dev-gha-infra`** — assumed by `infra-*.yml` workflows. Terraform admin permissions. Used for `terraform plan` and `terraform apply`.
-- **`citibike-lake-dev-gha-pipeline`** — assumed by `dbt-cd.yml`, `dqdl-cd.yml`, `lambda-cd.yml`, `image-cd.yml`. Narrow scope: S3 PutObject on the artifacts bucket, ECR push on the dbt-runner repo, `lambda:UpdateFunctionCode` on the project Lambdas, `glue:UpdateDataQualityRuleset`, Lake Formation tag application.
+- **`citibike-lake-dev-gha-infra`** — assumed by `infra-*.yml` workflows. Terraform admin permissions. Used for `terraform plan` and `terraform apply`. Trust: `sub` LIKE `repo:<org>/<repo>:*`.
+- **`citibike-lake-dev-gha-pipeline`** — assumed by `dbt-cd.yml`, `dbt-manifest-cd.yml`, `dqdl-cd.yml`, `lambda-cd.yml`, `image-cd.yml`. Narrow scope: S3 PutObject on the artifacts bucket, ECR push on the dbt-runner repo, `lambda:UpdateFunctionCode` on the project Lambdas, `glue:UpdateDataQualityRuleset`, Lake Formation tag application.
+- **`citibike-lake-dev-gha-ci`** — assumed by `dbt-ci.yml` and `dbt-ci-cleanup.yml` for per-PR slim builds. Reads the prod manifest from `s3://<artifacts>/dbt/manifest/*`; runs Athena on the dev workgroup; Glue read on the prod database; Glue CRUD scoped to `citibike_lake_dev_ci_pr_*`; S3 write scoped to `warehouse/citibike/iceberg/dbt-ci/*`. Trust: `sub` EQUALS `repo:<org>/<repo>:pull_request`. Fork PRs emit the same `sub`, so `dbt-ci.yml` adds a `head.repo.full_name == github.repository` guard at the job level — that's the real fork-PR boundary.
 
 ### Workflow set
 
@@ -333,12 +334,25 @@ Two IAM roles trust the GitHub OIDC provider (no long-lived secrets):
 |---|---|---|
 | [infra-ci.yml](.github/workflows/infra-ci.yml) | PR on `terraform/**` | fmt, validate, `terraform plan`, post plan as PR comment |
 | [infra-cd.yml](.github/workflows/infra-cd.yml) | push to main on `terraform/**` | plan → GitHub Environment approval → `terraform apply` |
-| [dbt-ci.yml](.github/workflows/dbt-ci.yml) | PR on `dbt/**` | install dbt-athena, `dbt parse` |
+| [dbt-ci.yml](.github/workflows/dbt-ci.yml) | PR on `dbt/**` | `dbt parse` (always) + slim deferred build of `state:modified+` against a per-PR Glue database (same-repo PRs only) |
+| [dbt-ci-cleanup.yml](.github/workflows/dbt-ci-cleanup.yml) | PR close + daily cron | drop the per-PR Glue DB + delete its S3 prefix; cron sweeps >7-day orphans |
 | [dbt-cd.yml](.github/workflows/dbt-cd.yml) | push to main on `dbt/**` | tar dbt project, upload to `s3://artifacts/dbt/<sha>.tar.gz` + bump `latest.tar.gz` |
+| [dbt-manifest-cd.yml](.github/workflows/dbt-manifest-cd.yml) | push to main on `dbt/**` | `dbt parse` + upload `manifest.json` to `s3://artifacts/dbt/manifest/parse-fallback/` — bootstrap baseline for slim-CI deferral |
 | [dqdl-ci.yml](.github/workflows/dqdl-ci.yml) | PR on `terraform/dqdl/**` | render template, structural check |
 | [dqdl-cd.yml](.github/workflows/dqdl-cd.yml) | push to main on `terraform/dqdl/**` | render, archive to S3, `aws glue update-data-quality-ruleset` |
 | [lambda-cd.yml](.github/workflows/lambda-cd.yml) | push to main on `src/lambda/**` | zip per Lambda, upload to S3, `aws lambda update-function-code` |
 | [image-cd.yml](.github/workflows/image-cd.yml) | push to main on `docker/dbt-runner/**` | `docker buildx build --push` to ECR (rare; project code is no longer in the image) |
+
+### Slim CI: deferred build of changed models on PRs
+
+PR slim-CI builds **only the models that changed in the PR plus their downstream dependents**, deferring unchanged refs to the live prod tables (`dbt build --select state:modified+ --state state/ --defer --favor-state`). This catches Jinja/ref errors, breaking schema changes, and failing tests on the affected subgraph, without rebuilding the whole DAG on every PR.
+
+For `state:modified+` to work, dbt needs a **prod-state manifest** to compare the PR's parsed manifest against. The repo preserves it via two writers — one source of truth:
+
+1. **Authoritative**: the Batch dbt-runner ([docker/dbt-runner/entrypoint.sh](docker/dbt-runner/entrypoint.sh)) uploads `target/manifest.json` + `run_results.json` to `s3://<artifacts>/dbt/manifest/{latest,history/<ts>}/` after every green run. `latest/` is the rolling pointer slim-CI defers against; `history/<ts>/` is a forensic trail for diffing prod state across deploys.
+2. **Bootstrap fallback**: [dbt-manifest-cd.yml](.github/workflows/dbt-manifest-cd.yml) runs `dbt parse` on every push to main and uploads to `s3://<artifacts>/dbt/manifest/parse-fallback/`. This means slim-CI works from day one (before the Batch runner has produced a green run) and stays functional when `enable_pipeline_orchestration = false`.
+
+Each PR's slim build writes into a dedicated Glue database `citibike_lake_dev_ci_pr_<num>` (created on demand by dbt-athena). The `dbt-ci-cleanup` workflow drops it on PR close; a daily cron sweeps any orphans older than 7 days.
 
 ### How pipeline code reaches the runtime
 
@@ -360,6 +374,9 @@ For the workflows above to run, configure on the repo:
 | Actions variable `AWS_REGION` | e.g. `us-east-1` |
 | Environment `production-apply` | Add required reviewers; `infra-cd.yml` blocks here |
 | CODEOWNERS | Replace `@harichinnan` with your team handles |
+| Branch protection (`main`) | Require `dbt-ci / slim-build` to pass (and `dbt-ci / parse` as the fallback for fork PRs where slim-build is skipped) |
+
+When Lake Formation is on (`enable_lake_formation_governance = true`), the `gha-ci` role is auto-granted `DESCRIBE`/`SELECT` on the prod database via [terraform/lakeformation.tf](terraform/lakeformation.tf), but creating the per-PR CI database under LF requires `CREATE_DATABASE` at the catalog level — not auto-wired to keep the blast radius small. Either add `aws_iam_role.gha_ci.arn` to `var.lake_formation_admin_principal_arns`, or pre-create the per-PR databases through a separate process.
 
 ### Adapting to multiple environments
 

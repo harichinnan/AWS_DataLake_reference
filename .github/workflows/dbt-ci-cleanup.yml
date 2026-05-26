@@ -1,0 +1,94 @@
+name: dbt-ci-cleanup
+
+# Drops the per-PR Glue database created by dbt-ci.yml (citibike_lake_dev_ci_pr_<num>)
+# and deletes its S3 prefix. Runs:
+#   - on PR close (merged or not) — primary cleanup path
+#   - daily cron — safety net for PRs where the close-event cleanup failed
+#     (e.g. transient AWS errors), or PRs closed before this workflow existed.
+#
+# Reuses the gha-ci role so the permissions footprint matches what dbt-ci
+# already needs.
+
+on:
+  pull_request:
+    types: [closed]
+  schedule:
+    # 07:00 UTC daily — picks up any orphans missed by the close-event handler.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to clean up (omit to GC all citibike_lake_dev_ci_pr_* databases older than 7 days)'
+        required: false
+        type: string
+
+concurrency:
+  group: dbt-ci-cleanup-${{ github.event.pull_request.number || github.event.inputs.pr_number || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  WAREHOUSE_BUCKET: citibike-lake-dev-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-warehouse
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    # Skip fork-PR close events — fork PRs never got a slim build, so there's
+    # nothing to clean up, and gha-ci's trust policy wouldn't let the fork's
+    # OIDC token assume the role anyway.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/citibike-lake-dev-gha-ci
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Drop single PR's CI database
+        if: github.event_name == 'pull_request' || github.event.inputs.pr_number != ''
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+        run: |
+          DB="citibike_lake_dev_ci_pr_${PR_NUMBER}"
+          echo "Cleaning up ${DB}"
+
+          # Glue DeleteDatabase cascades to tables. 200 if it existed, 404 if
+          # the PR had no dbt changes (slim build skipped) — both are fine.
+          if aws glue get-database --name "$DB" >/dev/null 2>&1; then
+            aws glue delete-database --name "$DB"
+            echo "Dropped Glue database $DB"
+          else
+            echo "Glue database $DB does not exist; nothing to drop"
+          fi
+
+          # Delete the corresponding S3 prefix. dbt-athena uses
+          # s3_data_naming=schema_table_unique, so data files live under
+          # warehouse/citibike/iceberg/dbt-ci/<schema>_<table>_<uuid>/.
+          # `aws s3 rm --recursive` is a no-op when the prefix is empty.
+          PREFIX="warehouse/citibike/iceberg/dbt-ci/${DB}"
+          echo "Removing s3://${WAREHOUSE_BUCKET}/${PREFIX}/"
+          aws s3 rm "s3://${WAREHOUSE_BUCKET}/${PREFIX}/" --recursive || true
+
+      - name: GC stale CI databases (cron / dispatch-without-PR)
+        if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.pr_number == '')
+        run: |
+          # Anything older than 7 days under the citibike_lake_dev_ci_pr_*
+          # pattern is an orphan. Listing via the Glue API and filtering by
+          # CreateTime keeps the policy of "explicit pattern match" rather
+          # than blast-radius "everything in the catalog".
+          CUTOFF=$(date -u -d '7 days ago' +%s 2>/dev/null || date -u -v-7d +%s)
+
+          aws glue get-databases --query 'DatabaseList[?starts_with(Name, `citibike_lake_dev_ci_pr_`)].[Name,CreateTime]' --output text \
+          | while read -r name created; do
+              created_ts=$(date -u -d "$created" +%s 2>/dev/null || date -u -j -f "%Y-%m-%dT%H:%M:%S" "${created%%.*}" +%s)
+              if [[ "$created_ts" -lt "$CUTOFF" ]]; then
+                echo "GC: dropping $name (created $created)"
+                aws glue delete-database --name "$name" || true
+                aws s3 rm "s3://${WAREHOUSE_BUCKET}/warehouse/citibike/iceberg/dbt-ci/${name}/" --recursive || true
+              else
+                echo "Keep: $name (created $created)"
+              fi
+            done

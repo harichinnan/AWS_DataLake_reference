@@ -4,16 +4,22 @@ on:
   pull_request:
     paths:
       - 'dbt/**'
+      - 'docker/dbt-runner/requirements.txt'
       - '.github/workflows/dbt-ci.yml'
 
 concurrency:
-  group: dbt-ci-${{ github.ref }}
+  # One slim build per PR. Newer pushes cancel in-flight builds.
+  group: dbt-ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
+  id-token: write
   contents: read
+  pull-requests: write   # for the step-summary + (future) PR comment
 
 jobs:
+  # Cheap, runs on every PR (including forks). Validates ref/source resolution,
+  # Jinja syntax, and macro signatures without hitting AWS.
   parse:
     runs-on: ubuntu-latest
     steps:
@@ -29,8 +35,114 @@ jobs:
         run: pip install -r docker/dbt-runner/requirements.txt
 
       - name: dbt parse
-        # Parse compiles the project graph without hitting the warehouse — verifies
-        # ref/source resolution, Jinja syntax, and macro signatures.
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
         run: dbt parse --project-dir dbt --profiles-dir dbt --target dev || dbt parse --project-dir dbt --profiles-dir dbt
+
+  # Deferred build of just the changed models + their downstream dependents.
+  # Skipped on fork PRs — OIDC trust alone can't distinguish forks from
+  # first-party PRs (sub is identical), so the head-repo guard is what gates
+  # AWS access.
+  slim-build:
+    needs: parse
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ARTIFACTS_BUCKET: citibike-lake-dev-artifacts-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}
+      WAREHOUSE_BUCKET: citibike-lake-dev-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-warehouse
+      ATHENA_RESULTS_BUCKET: citibike-lake-dev-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}-athena-results
+      DBT_ATHENA_WORKGROUP: citibike-lake-dev-wg
+      DBT_PROFILES_DIR: ${{ github.workspace }}/dbt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: docker/dbt-runner/requirements.txt
+
+      - name: Install dbt-athena
+        run: pip install -r docker/dbt-runner/requirements.txt
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/citibike-lake-dev-gha-ci
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Download prod manifest (latest, fall back to parse-fallback)
+        # Slim CI needs a "prod state" manifest to diff against. Primary source
+        # is the Batch dbt-runner's post-run upload; the parse-fallback workflow
+        # bootstraps it on first deploy. Hard-fail if neither exists — we want
+        # the PR author to know slim CI is degraded rather than silently
+        # building everything.
+        run: |
+          mkdir -p state
+          if aws s3 cp "s3://${ARTIFACTS_BUCKET}/dbt/manifest/latest/manifest.json" state/manifest.json 2>/dev/null; then
+            echo "Using runner-published manifest from dbt/manifest/latest/"
+          elif aws s3 cp "s3://${ARTIFACTS_BUCKET}/dbt/manifest/parse-fallback/manifest.json" state/manifest.json 2>/dev/null; then
+            echo "Using parse-fallback manifest from dbt/manifest/parse-fallback/"
+          else
+            echo "::error::No prod manifest found in s3://${ARTIFACTS_BUCKET}/dbt/manifest/{latest,parse-fallback}/. Did dbt-cd / dbt-manifest-cd ever run on main?"
+            exit 1
+          fi
+
+      - name: Resolve PR-scoped CI schema
+        id: schema
+        run: |
+          # dbt-athena creates this Glue database on first model build; the
+          # dbt-ci-cleanup workflow drops it when the PR closes.
+          PR_SCHEMA="citibike_lake_dev_ci_pr_${{ github.event.pull_request.number }}"
+          echo "schema=${PR_SCHEMA}" >> "$GITHUB_OUTPUT"
+          echo "Per-PR Glue database: ${PR_SCHEMA}"
+
+      - name: dbt deps + parse
+        env:
+          DBT_ATHENA_SCHEMA: ${{ steps.schema.outputs.schema }}
+          DBT_ATHENA_STAGING_DIR: s3://${{ env.ATHENA_RESULTS_BUCKET }}/dbt-ci/
+          DBT_ATHENA_DATA_DIR: s3://${{ env.WAREHOUSE_BUCKET }}/warehouse/citibike/iceberg/dbt-ci/
+        run: |
+          dbt deps --project-dir dbt --profiles-dir dbt
+          dbt parse --project-dir dbt --profiles-dir dbt --target ci
+
+      - name: List state:modified+ nodes
+        id: ls
+        env:
+          DBT_ATHENA_SCHEMA: ${{ steps.schema.outputs.schema }}
+          DBT_ATHENA_STAGING_DIR: s3://${{ env.ATHENA_RESULTS_BUCKET }}/dbt-ci/
+          DBT_ATHENA_DATA_DIR: s3://${{ env.WAREHOUSE_BUCKET }}/warehouse/citibike/iceberg/dbt-ci/
+        run: |
+          # `dbt ls` exits 0 with no output when nothing matches; capture so
+          # the next step can skip the actual build for no-op PRs.
+          dbt ls \
+            --project-dir dbt --profiles-dir dbt --target ci \
+            --select state:modified+ \
+            --state state \
+            --resource-type model --resource-type test --resource-type seed --resource-type snapshot \
+            --output name > /tmp/modified.txt || true
+
+          echo "### Affected dbt nodes" >> "$GITHUB_STEP_SUMMARY"
+          if [[ -s /tmp/modified.txt ]]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat /tmp/modified.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "_No models/tests affected by this PR. Slim build skipped._" >> "$GITHUB_STEP_SUMMARY"
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Slim build (state:modified+ with --defer --favor-state)
+        if: steps.ls.outputs.has_changes == 'true'
+        env:
+          DBT_ATHENA_SCHEMA: ${{ steps.schema.outputs.schema }}
+          DBT_ATHENA_STAGING_DIR: s3://${{ env.ATHENA_RESULTS_BUCKET }}/dbt-ci/
+          DBT_ATHENA_DATA_DIR: s3://${{ env.WAREHOUSE_BUCKET }}/warehouse/citibike/iceberg/dbt-ci/
+        run: |
+          dbt build \
+            --project-dir dbt --profiles-dir dbt --target ci \
+            --select state:modified+ \
+            --state state \
+            --defer --favor-state \
+            --fail-fast

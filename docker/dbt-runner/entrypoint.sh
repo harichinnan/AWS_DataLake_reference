@@ -52,4 +52,23 @@ if [[ "$DBT_FULL_REFRESH" == "true" ]]; then
 fi
 
 echo "Running: dbt ${ARGS[*]}"
-exec dbt "${ARGS[@]}"
+set +e
+dbt "${ARGS[@]}"
+DBT_EXIT_CODE=$?
+set -e
+
+# On a green run, publish target/manifest.json + run_results.json to the
+# artifacts bucket. PR slim-CI defers against `latest/`; `history/<ts>/` keeps
+# a forensic trail for diffing prod-state across deploys. Skip silently when
+# ARTIFACTS_BUCKET is unset (e.g. ad-hoc local invocations of this image).
+if [[ "$DBT_EXIT_CODE" -eq 0 && -n "${ARTIFACTS_BUCKET:-}" ]]; then
+  TS=$(date -u +%Y%m%dT%H%M%SZ)
+  for f in manifest.json run_results.json; do
+    if [[ -f "target/$f" ]]; then
+      aws s3 cp "target/$f" "s3://${ARTIFACTS_BUCKET}/dbt/manifest/latest/$f"
+      aws s3 cp "target/$f" "s3://${ARTIFACTS_BUCKET}/dbt/manifest/history/${TS}/$f"
+    fi
+  done
+fi
+
+exit "$DBT_EXIT_CODE"

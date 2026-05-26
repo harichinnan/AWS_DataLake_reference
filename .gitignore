@@ -42,3 +42,6 @@ dbt/.user.yml
 .idea/
 .vscode/
 *.swp
+
+# Auxiliary docs (architecture notes, generated PDFs, scratch material)
+docs/

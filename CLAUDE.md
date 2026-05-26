@@ -163,14 +163,29 @@ AWS_PROFILE=citibike-lake-dev python3 scripts/setup_metabase.py
 Pipeline-vs-infra separation lives in [.github/workflows/](.github/workflows/):
 
 - `infra-ci.yml` / `infra-cd.yml` → Terraform plan on PR, apply on main (with `production-apply` Environment approval).
+- `dbt-ci.yml` → on PR affecting `dbt/**`, runs `dbt parse` (always) + a slim deferred build of `state:modified+` against a per-PR Glue database `citibike_lake_dev_ci_pr_<num>` (only when the PR is from the same repo, not a fork). Downloads the prod manifest from `s3://<artifacts>/dbt/manifest/latest/` (fallback: `…/parse-fallback/`). See [.github/workflows/dbt-ci.yml](.github/workflows/dbt-ci.yml).
+- `dbt-ci-cleanup.yml` → on PR close + daily cron, drops the per-PR Glue database and its S3 prefix. See [.github/workflows/dbt-ci-cleanup.yml](.github/workflows/dbt-ci-cleanup.yml).
 - `dbt-cd.yml` → on merge to main affecting `dbt/**`, tars the project to `s3://<artifacts>/dbt/<sha>.tar.gz` + `latest.tar.gz`. The Batch dbt-runner downloads `latest.tar.gz` at job startup via `DBT_PROJECT_S3_URI` (see [docker/dbt-runner/entrypoint.sh](docker/dbt-runner/entrypoint.sh)).
+- `dbt-manifest-cd.yml` → on merge to main affecting `dbt/**`, runs `dbt parse` and publishes `manifest.json` to `s3://<artifacts>/dbt/manifest/parse-fallback/manifest.json`. Bootstraps slim-CI deferral before the Batch runner has ever produced a green run, and stays as a safety net when `enable_pipeline_orchestration = false`.
 - `dqdl-cd.yml` → on merge to main affecting `terraform/dqdl/**`, calls `aws glue update-data-quality-ruleset`. The Terraform `aws_glue_data_quality_ruleset` resource has `lifecycle { ignore_changes = [ruleset] }` so subsequent applies don't revert.
 - `lambda-cd.yml` → on merge to main affecting `src/lambda/**`, zips and updates each Lambda via `aws lambda update-function-code`. The Lambda resources have `lifecycle { ignore_changes = [filename, source_code_hash] }`.
 - `image-cd.yml` → on merge to main affecting `docker/dbt-runner/**`. Rare — the project files were removed from the image.
 
-AWS auth uses GitHub OIDC; two roles ([terraform/cicd.tf](terraform/cicd.tf)):
-- `citibike-lake-dev-gha-infra` — Terraform admin (PowerUserAccess + IAMFullAccess)
-- `citibike-lake-dev-gha-pipeline` — narrow scope (artifacts S3 PutObject, ECR push, lambda:UpdateFunctionCode, glue:UpdateDataQualityRuleset, LF tag mgmt)
+### Manifest preservation
+
+PR slim-CI needs a "prod state" manifest to diff against (`dbt build --select state:modified+ --state state/ --defer --favor-state`). Two writers, one source of truth:
+
+1. **Batch dbt-runner** ([docker/dbt-runner/entrypoint.sh](docker/dbt-runner/entrypoint.sh)) — after a green `dbt build`, uploads `target/manifest.json` + `target/run_results.json` to `s3://<artifacts>/dbt/manifest/latest/` (rolling) and `…/history/<ISO_TS>/` (forensic trail). The `ARTIFACTS_BUCKET` env on the Batch job definition gates this; unset to disable. **This is the authoritative state** — it reflects what's actually deployed.
+2. **`dbt-manifest-cd.yml`** — uploads a parse-only manifest to `…/parse-fallback/manifest.json` on every merge to main. Bootstrap + fallback only — dbt-ci reads `latest/` first, falls back to `parse-fallback/`, hard-fails if neither exists.
+
+AWS auth uses GitHub OIDC; three roles ([terraform/cicd.tf](terraform/cicd.tf)):
+- `citibike-lake-dev-gha-infra` — Terraform admin (PowerUserAccess + IAMFullAccess). Trust: `sub` LIKE `repo:<org>/<repo>:*`.
+- `citibike-lake-dev-gha-pipeline` — narrow scope (artifacts S3 PutObject, ECR push, lambda:UpdateFunctionCode, glue:UpdateDataQualityRuleset, LF tag mgmt). Trust: same.
+- `citibike-lake-dev-gha-ci` — slim-CI scope: manifest read, Athena exec on the dev workgroup, Glue read on the prod database, Glue CRUD scoped to `citibike_lake_dev_ci_pr_*`, S3 read on raw + warehouse, S3 write scoped to `warehouse/citibike/iceberg/dbt-ci/*`, full access to athena results. Trust: `sub` EQUALS `repo:<org>/<repo>:pull_request`. **Fork PRs emit the same `sub`** — `dbt-ci.yml` adds the `head.repo.full_name == github.repository` guard, which is the real fork-PR boundary.
+
+### Lake Formation + CI
+
+When `enable_lake_formation_governance = true`, [terraform/lakeformation.tf](terraform/lakeformation.tf) automatically grants `gha-ci` DESCRIBE+SELECT on the prod database via `lake_formation_readonly_principals` — needed for `--favor-state` reads against deferred refs. **Creating the per-PR CI database under LF requires LF `CREATE_DATABASE` at the catalog level**, which is not auto-granted (would expand blast radius). When LF is on, either add `aws_iam_role.gha_ci.arn` to `var.lake_formation_admin_principal_arns`, or pre-create the per-PR databases through a separate process.
 
 Governance tags taxonomy in [terraform/governance_tags.tf](terraform/governance_tags.tf); per-model tag values in each dbt model's `lf_tags_config` block. dbt-athena applies the tags on every run.
 
@@ -178,6 +193,7 @@ Required repo configuration:
 - Actions variables `AWS_ACCOUNT_ID` and `AWS_REGION`
 - Environment `production-apply` with required reviewers
 - CODEOWNERS handles (currently all `@harichinnan` — swap for real team handles)
+- Branch protection on `main` should require the `dbt-ci / slim-build` check to pass (and `parse` as a fallback for fork PRs where slim-build is skipped).
 
 ## Conventions and Gotchas
 

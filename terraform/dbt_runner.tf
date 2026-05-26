@@ -300,6 +300,14 @@ data "aws_iam_policy_document" "dbt_runner_task_policy" {
     resources = ["${aws_s3_bucket.artifacts.arn}/dbt/*"]
   }
 
+  # Manifest publishing for PR slim-CI deferral. Scoped to dbt/manifest/* so
+  # the runner can't overwrite the source-of-truth tarball at dbt/latest.tar.gz.
+  statement {
+    sid       = "ArtifactsManifestWrite"
+    actions   = ["s3:PutObject", "s3:PutObjectAcl", "s3:AbortMultipartUpload"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/dbt/manifest/*"]
+  }
+
   statement {
     sid       = "ArtifactsBucketList"
     actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
@@ -461,6 +469,10 @@ resource "aws_batch_job_definition" "dbt" {
       # path. The container downloads + extracts it at runtime; the image
       # itself does not bundle the dbt project.
       { name = "DBT_PROJECT_S3_URI", value = "s3://${aws_s3_bucket.artifacts.bucket}/dbt/latest.tar.gz" },
+      # On green runs the entrypoint uploads target/manifest.json +
+      # run_results.json under dbt/manifest/{latest,history/<ts>}/. PR slim-CI
+      # defers against latest/. Unset to disable manifest publishing.
+      { name = "ARTIFACTS_BUCKET", value = aws_s3_bucket.artifacts.bucket },
     ]
 
     logConfiguration = {

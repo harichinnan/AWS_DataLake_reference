@@ -20,6 +20,14 @@ locals {
 
   gha_infra_role_name    = "${local.name_prefix}-gha-infra"
   gha_pipeline_role_name = "${local.name_prefix}-gha-pipeline"
+  gha_ci_role_name       = "${local.name_prefix}-gha-ci"
+
+  # PR slim-CI runs build into per-PR Glue databases under this prefix. dbt
+  # creates the databases on demand; cleanup workflow drops them on PR close.
+  ci_glue_database_prefix = "${local.glue_database}_ci_pr_"
+
+  # CI dbt build writes Iceberg data here (separate from the prod dbt prefix).
+  ci_warehouse_prefix = "${local.warehouse_prefix}/dbt-ci"
 }
 
 ###############################################################################
@@ -240,6 +248,212 @@ resource "aws_iam_role_policy" "gha_pipeline" {
 }
 
 ###############################################################################
+# gha-ci — pull_request-scoped role used by dbt-ci.yml for slim CI builds.   #
+#                                                                             #
+# Trust is locked to GitHub OIDC tokens with sub=`...:pull_request` (so push  #
+# and workflow_dispatch tokens cannot assume it). Fork PRs DO emit the same   #
+# sub, so dbt-ci.yml additionally guards the slim-build job with              #
+# `if: github.event.pull_request.head.repo.full_name == github.repository`.   #
+###############################################################################
+
+data "aws_iam_policy_document" "gha_ci_assume" {
+  statement {
+    actions = ["sts:AssumeRoleWithWebIdentity"]
+
+    principals {
+      type        = "Federated"
+      identifiers = [aws_iam_openid_connect_provider.github.arn]
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:aud"
+      values   = local.github_oidc_audiences
+    }
+
+    condition {
+      test     = "StringEquals"
+      variable = "token.actions.githubusercontent.com:sub"
+      values   = ["repo:${var.github_org}/${var.github_repo}:pull_request"]
+    }
+  }
+}
+
+resource "aws_iam_role" "gha_ci" {
+  name               = local.gha_ci_role_name
+  assume_role_policy = data.aws_iam_policy_document.gha_ci_assume.json
+  description        = "Assumed by .github/workflows/dbt-ci.yml for slim CI builds against per-PR Glue databases."
+}
+
+data "aws_iam_policy_document" "gha_ci" {
+  # Read the prod manifest published by the Batch dbt-runner (or the parse
+  # fallback workflow) — needed for `dbt build --select state:modified+`.
+  statement {
+    sid       = "ManifestRead"
+    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/dbt/manifest/*"]
+  }
+
+  statement {
+    sid       = "ArtifactsBucketList"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [aws_s3_bucket.artifacts.arn]
+  }
+
+  # Athena query exec on the shared workgroup. CI reuses the dev workgroup
+  # rather than provisioning a parallel one — split it out later if cost
+  # attribution matters.
+  statement {
+    sid = "AthenaQueryExec"
+    actions = [
+      "athena:StartQueryExecution",
+      "athena:GetQueryExecution",
+      "athena:GetQueryResults",
+      "athena:GetQueryResultsStream",
+      "athena:StopQueryExecution",
+      "athena:GetWorkGroup",
+      "athena:ListWorkGroups",
+      "athena:GetDataCatalog",
+      "athena:ListDataCatalogs",
+      "athena:ListDatabases",
+      "athena:GetDatabase",
+      "athena:ListTableMetadata",
+      "athena:GetTableMetadata",
+    ]
+    resources = [
+      aws_athena_workgroup.citibike.arn,
+      "arn:${data.aws_partition.current.partition}:athena:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:datacatalog/AwsDataCatalog",
+    ]
+  }
+
+  # Read prod Glue metadata for `--favor-state` deferral against unchanged
+  # refs + sources.
+  statement {
+    sid = "GlueReadProd"
+    actions = [
+      "glue:GetDatabase",
+      "glue:GetDatabases",
+      "glue:GetTable",
+      "glue:GetTables",
+      "glue:GetPartition",
+      "glue:GetPartitions",
+      "glue:BatchGetPartition",
+    ]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:glue:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:catalog",
+      "arn:${data.aws_partition.current.partition}:glue:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:database/${local.glue_database}",
+      "arn:${data.aws_partition.current.partition}:glue:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:table/${local.glue_database}/*",
+    ]
+  }
+
+  # CRUD on the per-PR CI databases (citibike_lake_dev_ci_pr_*). dbt creates
+  # them on demand during the slim build; cleanup workflow drops them on PR
+  # close.
+  statement {
+    sid = "GlueCrudCI"
+    actions = [
+      "glue:CreateDatabase",
+      "glue:DeleteDatabase",
+      "glue:UpdateDatabase",
+      "glue:GetDatabase",
+      "glue:GetDatabases",
+      "glue:CreateTable",
+      "glue:DeleteTable",
+      "glue:UpdateTable",
+      "glue:GetTable",
+      "glue:GetTables",
+      "glue:BatchDeleteTable",
+      "glue:CreatePartition",
+      "glue:DeletePartition",
+      "glue:UpdatePartition",
+      "glue:GetPartition",
+      "glue:GetPartitions",
+      "glue:BatchCreatePartition",
+      "glue:BatchDeletePartition",
+      "glue:BatchGetPartition",
+    ]
+    resources = [
+      "arn:${data.aws_partition.current.partition}:glue:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:catalog",
+      "arn:${data.aws_partition.current.partition}:glue:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:database/${local.ci_glue_database_prefix}*",
+      "arn:${data.aws_partition.current.partition}:glue:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:table/${local.ci_glue_database_prefix}*/*",
+      "arn:${data.aws_partition.current.partition}:glue:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:userDefinedFunction/${local.ci_glue_database_prefix}*/*",
+    ]
+  }
+
+  # Bucket-level list — Athena + dbt-athena both call ListBucket during
+  # planning + Iceberg metadata reads.
+  statement {
+    sid = "S3LakeList"
+    actions = [
+      "s3:ListBucket",
+      "s3:GetBucketLocation",
+    ]
+    resources = [
+      aws_s3_bucket.lake["raw"].arn,
+      aws_s3_bucket.lake["warehouse"].arn,
+      aws_s3_bucket.lake["athena_results"].arn,
+    ]
+  }
+
+  # Read prod source data (raw CSVs) and prod warehouse (Iceberg data files
+  # referenced by `--favor-state`).
+  statement {
+    sid = "S3ProdRead"
+    actions = [
+      "s3:GetObject",
+      "s3:GetObjectVersion",
+    ]
+    resources = [
+      "${aws_s3_bucket.lake["raw"].arn}/*",
+      "${aws_s3_bucket.lake["warehouse"].arn}/*",
+    ]
+  }
+
+  # Write the per-PR CI build's Iceberg data files. Scoped to the dbt-ci
+  # prefix so an escaped PR can't trample prod warehouse data.
+  statement {
+    sid = "S3CIWrite"
+    actions = [
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:AbortMultipartUpload",
+      "s3:ListMultipartUploadParts",
+    ]
+    resources = [
+      "${aws_s3_bucket.lake["warehouse"].arn}/${local.ci_warehouse_prefix}/*",
+    ]
+  }
+
+  # Athena results — workgroup writes query state + results here.
+  statement {
+    sid = "S3AthenaResults"
+    actions = [
+      "s3:GetObject",
+      "s3:PutObject",
+      "s3:DeleteObject",
+      "s3:AbortMultipartUpload",
+      "s3:ListMultipartUploadParts",
+    ]
+    resources = ["${aws_s3_bucket.lake["athena_results"].arn}/*"]
+  }
+
+  # LF data-access stub — when enable_lake_formation_governance is on the LF
+  # grants in lakeformation.tf add this role to readonly_principals; reading
+  # prod tables flows through LF. Harmless when LF is off.
+  statement {
+    sid       = "LakeFormation"
+    actions   = ["lakeformation:GetDataAccess"]
+    resources = ["*"]
+  }
+}
+
+resource "aws_iam_role_policy" "gha_ci" {
+  name   = "${local.gha_ci_role_name}-policy"
+  role   = aws_iam_role.gha_ci.id
+  policy = data.aws_iam_policy_document.gha_ci.json
+}
+
+###############################################################################
 # Outputs
 ###############################################################################
 
@@ -256,6 +470,26 @@ output "github_actions_infra_role_arn" {
 output "github_actions_pipeline_role_arn" {
   description = "Role assumed by dbt-cd/dqdl-cd/lambda-cd/image-cd workflows."
   value       = aws_iam_role.gha_pipeline.arn
+}
+
+output "github_actions_ci_role_arn" {
+  description = "Role assumed by .github/workflows/dbt-ci.yml for per-PR slim dbt builds."
+  value       = aws_iam_role.gha_ci.arn
+}
+
+output "ci_glue_database_prefix" {
+  description = "Prefix for per-PR Glue databases provisioned by the dbt-ci slim-build workflow (e.g. citibike_lake_dev_ci_pr_42)."
+  value       = local.ci_glue_database_prefix
+}
+
+output "ci_dbt_athena_staging_dir" {
+  description = "Athena staging dir used by dbt-ci slim builds."
+  value       = "s3://${aws_s3_bucket.lake["athena_results"].bucket}/dbt-ci/"
+}
+
+output "ci_dbt_athena_data_dir" {
+  description = "Iceberg data root used by dbt-ci slim builds."
+  value       = "s3://${aws_s3_bucket.lake["warehouse"].bucket}/${local.ci_warehouse_prefix}/"
 }
 
 output "artifacts_bucket_name" {

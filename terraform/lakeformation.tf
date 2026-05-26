@@ -9,7 +9,11 @@ locals {
   lake_formation_readonly_principals = var.enable_lake_formation_governance ? merge(
     { for idx, arn in var.lake_formation_additional_readonly_principal_arns : "additional-${idx}" => arn },
     var.enable_metabase ? { metabase = aws_iam_role.metabase_task[0].arn } : {},
-    var.enable_glue_data_quality ? { glue_data_quality = aws_iam_role.glue_data_quality[0].arn } : {}
+    var.enable_glue_data_quality ? { glue_data_quality = aws_iam_role.glue_data_quality[0].arn } : {},
+    # PR slim-CI reads prod tables via `dbt build --defer --favor-state` —
+    # SELECT on the prod database is the LF half of what the IAM Glue grants
+    # already give it.
+    { gha_ci = aws_iam_role.gha_ci.arn }
   ) : {}
 
   lake_formation_data_location_principals = var.enable_lake_formation_governance ? merge(
