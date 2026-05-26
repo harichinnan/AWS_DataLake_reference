@@ -358,6 +358,18 @@ variable "alert_email" {
   default     = ""
 }
 
+variable "github_org" {
+  description = "GitHub organization or user that owns the repository (used for OIDC trust scoping)."
+  type        = string
+  default     = "harichinnan"
+}
+
+variable "github_repo" {
+  description = "GitHub repository name (used for OIDC trust scoping)."
+  type        = string
+  default     = "AWS_DataLake_reference"
+}
+
 variable "enable_pipeline_orchestration" {
   description = "If true, creates the AWS Batch dbt runner, Step Functions pipeline, and S3/cron triggers that orchestrate the auto-heal flow."
   type        = bool

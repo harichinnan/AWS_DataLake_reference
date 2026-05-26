@@ -318,6 +318,53 @@ aws lambda invoke \
 
 ---
 
+## CI/CD and ownership model
+
+The repo separates **DevOps** (infrastructure) from **pipeline code** (transformation logic, quality rules, Lambda business logic). Each lifecycle has its own GitHub Actions workflow under [.github/workflows/](.github/workflows/), and a [.github/CODEOWNERS](.github/CODEOWNERS) file routes PR review to the right team by path.
+
+Two IAM roles trust the GitHub OIDC provider (no long-lived secrets):
+
+- **`citibike-lake-dev-gha-infra`** — assumed by `infra-*.yml` workflows. Terraform admin permissions. Used for `terraform plan` and `terraform apply`.
+- **`citibike-lake-dev-gha-pipeline`** — assumed by `dbt-cd.yml`, `dqdl-cd.yml`, `lambda-cd.yml`, `image-cd.yml`. Narrow scope: S3 PutObject on the artifacts bucket, ECR push on the dbt-runner repo, `lambda:UpdateFunctionCode` on the project Lambdas, `glue:UpdateDataQualityRuleset`, Lake Formation tag application.
+
+### Workflow set
+
+| Workflow | Trigger (path filter) | What it does |
+|---|---|---|
+| [infra-ci.yml](.github/workflows/infra-ci.yml) | PR on `terraform/**` | fmt, validate, `terraform plan`, post plan as PR comment |
+| [infra-cd.yml](.github/workflows/infra-cd.yml) | push to main on `terraform/**` | plan → GitHub Environment approval → `terraform apply` |
+| [dbt-ci.yml](.github/workflows/dbt-ci.yml) | PR on `dbt/**` | install dbt-athena, `dbt parse` |
+| [dbt-cd.yml](.github/workflows/dbt-cd.yml) | push to main on `dbt/**` | tar dbt project, upload to `s3://artifacts/dbt/<sha>.tar.gz` + bump `latest.tar.gz` |
+| [dqdl-ci.yml](.github/workflows/dqdl-ci.yml) | PR on `terraform/dqdl/**` | render template, structural check |
+| [dqdl-cd.yml](.github/workflows/dqdl-cd.yml) | push to main on `terraform/dqdl/**` | render, archive to S3, `aws glue update-data-quality-ruleset` |
+| [lambda-cd.yml](.github/workflows/lambda-cd.yml) | push to main on `src/lambda/**` | zip per Lambda, upload to S3, `aws lambda update-function-code` |
+| [image-cd.yml](.github/workflows/image-cd.yml) | push to main on `docker/dbt-runner/**` | `docker buildx build --push` to ECR (rare; project code is no longer in the image) |
+
+### How pipeline code reaches the runtime
+
+The Docker image at [docker/dbt-runner/](docker/dbt-runner/) installs `dbt-athena-community` only — the dbt project is **not** baked in. At Batch job startup, [docker/dbt-runner/entrypoint.sh](docker/dbt-runner/entrypoint.sh) downloads the project tarball from S3 (`s3://<artifacts>/dbt/latest.tar.gz`, set as `DBT_PROJECT_S3_URI` on the Batch job definition) and extracts it into `/opt/dbt`. A dbt model change ships as a single `aws s3 cp` from CI — no Docker rebuild, no terraform apply.
+
+The Glue DQ ruleset, the three Lambda function codes, and the dbt-runner image are all created initially by Terraform but managed in steady state by CI: Terraform's `lifecycle { ignore_changes = … }` blocks tell it not to revert mutations made by the pipeline workflows.
+
+### Governance tag flow
+
+Lake Formation tag taxonomy ([terraform/governance_tags.tf](terraform/governance_tags.tf)) is platform-owned: tag keys (`domain`, `pii_level`, `freshness_tier`, `layer`), allowed values, and tag-based grants (e.g., any principal can `SELECT` from `pii_level in {none, low}` tables). Tag *assignment* per model lives in dbt: each model's `config()` block sets `lf_tags_config` with the values that apply. dbt-athena pushes the tags on every materialization, so a model rename or tag-value change ships through `dbt-cd.yml` like any other pipeline change.
+
+### Required GitHub configuration
+
+For the workflows above to run, configure on the repo:
+
+| Setting | Value |
+|---|---|
+| Actions variable `AWS_ACCOUNT_ID` | Your account ID |
+| Actions variable `AWS_REGION` | e.g. `us-east-1` |
+| Environment `production-apply` | Add required reviewers; `infra-cd.yml` blocks here |
+| CODEOWNERS | Replace `@harichinnan` with your team handles |
+
+### Adapting to multiple environments
+
+For a real production deployment, duplicate the OIDC roles and S3 artifacts bucket per environment (separate AWS accounts), parameterize the workflows by environment name (matrix or per-env workflow), and tag the trust policy with environment-specific `sub` constraints (e.g. `repo:org/repo:environment:prod`). The reference deploys a single environment; the workflow files are written so this extension is mostly a copy-rename.
+
 ## Operations and gotchas
 
 - **dbt-athena Iceberg incremental needs `unique_tmp_table_suffix=true`.** Without it, the `__dbt_tmp` table name is shared across runs and Iceberg's "non-empty location" check fires intermittently. All incremental Iceberg models in [dbt/models/](dbt/models/) set this.

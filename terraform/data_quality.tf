@@ -111,6 +111,12 @@ resource "aws_glue_data_quality_ruleset" "citibike_trips_silver" {
     table_name    = "citibike_trips_silver"
   }
 
+  lifecycle {
+    # Ruleset body is updated out-of-band by the dqdl-cd GitHub Actions
+    # workflow. Terraform seeds the initial ruleset on first apply only.
+    ignore_changes = [ruleset]
+  }
+
   depends_on = [
     aws_iam_role_policy.glue_data_quality
   ]

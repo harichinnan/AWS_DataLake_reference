@@ -158,6 +158,27 @@ AWS_PROFILE=citibike-lake-dev bash scripts/run_glue_data_quality.sh
 AWS_PROFILE=citibike-lake-dev python3 scripts/setup_metabase.py
 ```
 
+## CI/CD layout
+
+Pipeline-vs-infra separation lives in [.github/workflows/](.github/workflows/):
+
+- `infra-ci.yml` / `infra-cd.yml` → Terraform plan on PR, apply on main (with `production-apply` Environment approval).
+- `dbt-cd.yml` → on merge to main affecting `dbt/**`, tars the project to `s3://<artifacts>/dbt/<sha>.tar.gz` + `latest.tar.gz`. The Batch dbt-runner downloads `latest.tar.gz` at job startup via `DBT_PROJECT_S3_URI` (see [docker/dbt-runner/entrypoint.sh](docker/dbt-runner/entrypoint.sh)).
+- `dqdl-cd.yml` → on merge to main affecting `terraform/dqdl/**`, calls `aws glue update-data-quality-ruleset`. The Terraform `aws_glue_data_quality_ruleset` resource has `lifecycle { ignore_changes = [ruleset] }` so subsequent applies don't revert.
+- `lambda-cd.yml` → on merge to main affecting `src/lambda/**`, zips and updates each Lambda via `aws lambda update-function-code`. The Lambda resources have `lifecycle { ignore_changes = [filename, source_code_hash] }`.
+- `image-cd.yml` → on merge to main affecting `docker/dbt-runner/**`. Rare — the project files were removed from the image.
+
+AWS auth uses GitHub OIDC; two roles ([terraform/cicd.tf](terraform/cicd.tf)):
+- `citibike-lake-dev-gha-infra` — Terraform admin (PowerUserAccess + IAMFullAccess)
+- `citibike-lake-dev-gha-pipeline` — narrow scope (artifacts S3 PutObject, ECR push, lambda:UpdateFunctionCode, glue:UpdateDataQualityRuleset, LF tag mgmt)
+
+Governance tags taxonomy in [terraform/governance_tags.tf](terraform/governance_tags.tf); per-model tag values in each dbt model's `lf_tags_config` block. dbt-athena applies the tags on every run.
+
+Required repo configuration:
+- Actions variables `AWS_ACCOUNT_ID` and `AWS_REGION`
+- Environment `production-apply` with required reviewers
+- CODEOWNERS handles (currently all `@harichinnan` — swap for real team handles)
+
 ## Conventions and Gotchas
 
 - **Terraform root is `terraform/`, not the repo root.** Always pass `-chdir=terraform` (or `cd terraform`). The helper scripts handle this themselves via `$(dirname "$0")/../terraform`.

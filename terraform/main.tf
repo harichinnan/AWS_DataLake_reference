@@ -207,6 +207,13 @@ resource "aws_lambda_function" "citibike_ingest" {
     aws_cloudwatch_log_group.citibike_ingest,
     aws_iam_role_policy.citibike_ingest
   ]
+
+  lifecycle {
+    # Lambda code is updated out-of-band by the lambda-cd GitHub Actions
+    # workflow (aws lambda update-function-code). Terraform only seeds the
+    # initial code on first apply and manages configuration thereafter.
+    ignore_changes = [filename, source_code_hash]
+  }
 }
 
 resource "aws_cloudwatch_event_rule" "monthly_ingestion" {

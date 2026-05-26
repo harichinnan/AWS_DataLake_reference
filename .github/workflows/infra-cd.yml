@@ -1,0 +1,75 @@
+name: infra-cd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/infra-cd.yml'
+
+concurrency:
+  group: infra-cd
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      plan-artifact: ${{ steps.plan.outputs.artifact-name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/citibike-lake-dev-gha-infra
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      - name: terraform init
+        run: terraform -chdir=terraform init -input=false
+
+      - name: terraform plan
+        id: plan
+        run: |
+          terraform -chdir=terraform plan -no-color -input=false -lock=false -out tfplan
+          echo "artifact-name=tfplan-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform/tfplan
+          retention-days: 7
+
+  apply:
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: production-apply   # requires reviewer approval (configured in repo settings)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/citibike-lake-dev-gha-infra
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.13.0
+
+      - name: terraform init
+        run: terraform -chdir=terraform init -input=false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ github.sha }}
+          path: terraform/
+
+      - name: terraform apply
+        run: terraform -chdir=terraform apply -input=false -auto-approve tfplan

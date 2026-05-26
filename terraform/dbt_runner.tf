@@ -57,10 +57,13 @@ resource "null_resource" "dbt_runner_image_build" {
   count = local.pipeline_enabled ? 1 : 0
 
   triggers = {
+    # The image NO LONGER bakes in the dbt project — pipeline code is pulled
+    # from S3 at runtime by entrypoint.sh. So the trigger watches only the
+    # image's own contents (Dockerfile, entrypoint, pinned Python deps).
+    # dbt changes ship via dbt-cd.yml without rebuilding this image.
     dockerfile_hash   = filesha256("${path.module}/../docker/dbt-runner/Dockerfile")
     entrypoint_hash   = filesha256("${path.module}/../docker/dbt-runner/entrypoint.sh")
     requirements_hash = filesha256("${path.module}/../docker/dbt-runner/requirements.txt")
-    dbt_project_hash  = filesha256("${path.module}/../dbt/dbt_project.yml")
     repo_url          = aws_ecr_repository.dbt_runner[0].repository_url
     image_tag         = var.dbt_runner_image_tag
   }
@@ -232,10 +235,13 @@ data "aws_iam_policy_document" "dbt_runner_task_policy" {
   statement {
     sid = "Glue"
     actions = [
+      "glue:GetCatalogImportStatus",
       "glue:GetDatabase",
       "glue:GetDatabases",
       "glue:GetTable",
       "glue:GetTables",
+      "glue:GetTableVersion",
+      "glue:GetTableVersions",
       "glue:GetPartition",
       "glue:GetPartitions",
       "glue:CreateTable",
@@ -286,6 +292,18 @@ data "aws_iam_policy_document" "dbt_runner_task_policy" {
       "${aws_s3_bucket.lake["warehouse"].arn}/*",
       "${aws_s3_bucket.lake["athena_results"].arn}/*",
     ]
+  }
+
+  statement {
+    sid       = "ArtifactsBucketRead"
+    actions   = ["s3:GetObject", "s3:GetObjectVersion"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/dbt/*"]
+  }
+
+  statement {
+    sid       = "ArtifactsBucketList"
+    actions   = ["s3:ListBucket", "s3:GetBucketLocation"]
+    resources = [aws_s3_bucket.artifacts.arn]
   }
 
   statement {
@@ -439,6 +457,10 @@ resource "aws_batch_job_definition" "dbt" {
       { name = "DBT_ATHENA_WORKGROUP", value = aws_athena_workgroup.citibike.name },
       { name = "DBT_ATHENA_STAGING_DIR", value = local.dbt_staging_dir },
       { name = "DBT_ATHENA_DATA_DIR", value = local.dbt_data_dir },
+      # Pipeline code is published by .github/workflows/dbt-cd.yml to this S3
+      # path. The container downloads + extracts it at runtime; the image
+      # itself does not bundle the dbt project.
+      { name = "DBT_PROJECT_S3_URI", value = "s3://${aws_s3_bucket.artifacts.bucket}/dbt/latest.tar.gz" },
     ]
 
     logConfiguration = {

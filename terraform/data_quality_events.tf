@@ -119,6 +119,11 @@ resource "aws_lambda_function" "glue_dq_event_processor" {
     aws_cloudwatch_log_group.glue_dq_event_processor,
     aws_iam_role_policy.glue_dq_event_processor
   ]
+
+  lifecycle {
+    # Code updates flow through lambda-cd; Terraform only seeds initial code.
+    ignore_changes = [filename, source_code_hash]
+  }
 }
 
 data "aws_iam_policy_document" "stepfunctions_assume_role" {

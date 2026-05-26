@@ -90,6 +90,11 @@ resource "aws_lambda_function" "pipeline_kicker" {
     aws_iam_role_policy.pipeline_kicker,
     aws_cloudwatch_log_group.pipeline_kicker,
   ]
+
+  lifecycle {
+    # Code updates flow through lambda-cd; Terraform only seeds initial code.
+    ignore_changes = [filename, source_code_hash]
+  }
 }
 
 ###############################################################################

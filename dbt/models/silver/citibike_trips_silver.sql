@@ -4,10 +4,20 @@
     table_type='iceberg',
     incremental_strategy='merge',
     unique_key='ride_id',
+    unique_tmp_table_suffix=true,
     partitioned_by=['month(started_at)'],
     on_schema_change='sync_all_columns',
     table_properties={
       'optimize_rewrite_delete_file_threshold': '2'
+    },
+    lf_tags_config={
+      'enabled': true,
+      'tags': {
+        'domain': 'trips',
+        'layer': 'silver',
+        'pii_level': 'none',
+        'freshness_tier': 'daily'
+      }
     },
     post_hook=[
       "delete from {{ this }} where (source_year, source_month) in (select source_year, source_month from {{ ref('citibike_quarantine_filter') }})"

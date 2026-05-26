@@ -1,0 +1,25 @@
+# Code ownership routes PR review by path. Replace @harichinnan with the
+# appropriate GitHub team handles in a multi-team setup (e.g. @org/platform,
+# @org/data-engineering).
+
+# Platform / DevOps — owns AWS infra and CI/CD plumbing.
+/terraform/                       @harichinnan
+/.github/workflows/infra-ci.yml   @harichinnan
+/.github/workflows/infra-cd.yml   @harichinnan
+/.github/workflows/image-cd.yml   @harichinnan
+/docker/                          @harichinnan
+/.github/CODEOWNERS               @harichinnan
+
+# Data engineering — owns transformation logic and quality rules.
+/dbt/                             @harichinnan
+/terraform/dqdl/                  @harichinnan
+/src/lambda/                      @harichinnan
+/.github/workflows/dbt-ci.yml     @harichinnan
+/.github/workflows/dbt-cd.yml     @harichinnan
+/.github/workflows/dqdl-ci.yml    @harichinnan
+/.github/workflows/dqdl-cd.yml    @harichinnan
+/.github/workflows/lambda-cd.yml  @harichinnan
+
+# Docs are everyone's.
+/README.md                        @harichinnan
+/CLAUDE.md                        @harichinnan

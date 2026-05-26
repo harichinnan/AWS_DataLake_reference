@@ -1,0 +1,58 @@
+name: dqdl-cd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'terraform/dqdl/**'
+      - '.github/workflows/dqdl-cd.yml'
+
+concurrency:
+  group: dqdl-cd
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  RULESET_NAME: citibike-lake-dev-silver-dq
+  TEMPLATE_FILE: terraform/dqdl/citibike_trips_silver.dqdl.tftpl
+  # If the .tftpl ever gains additional substitutions, render them here.
+  CITIBIKE_START_DATE: '2026-01-01'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/citibike-lake-dev-gha-pipeline
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Render DQDL
+        run: |
+          SHA="${GITHUB_SHA::8}"
+          mkdir -p out
+          sed "s|\${start_date}|${CITIBIKE_START_DATE}|g" "$TEMPLATE_FILE" > "out/${SHA}.dqdl"
+          echo "--- rendered DQDL (first 20 lines) ---"
+          head -20 "out/${SHA}.dqdl"
+          echo "SHA=${SHA}" >> "$GITHUB_ENV"
+
+      - name: Archive in artifacts bucket
+        run: |
+          BUCKET="citibike-lake-dev-artifacts-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}"
+          aws s3 cp "out/${SHA}.dqdl" "s3://${BUCKET}/dqdl/${SHA}.dqdl"
+          aws s3 cp "out/${SHA}.dqdl" "s3://${BUCKET}/dqdl/latest.dqdl"
+
+      - name: Update Glue Data Quality ruleset
+        run: |
+          aws glue update-data-quality-ruleset \
+            --name "$RULESET_NAME" \
+            --description "Published by dbt-cd@${SHA}" \
+            --updated-ruleset "$(cat out/${SHA}.dqdl)"
+          aws glue get-data-quality-ruleset --name "$RULESET_NAME" \
+            --query '{Name: Name, LastModifiedOn: LastModifiedOn, RuleSet: Ruleset}' \
+            --output json | head -20

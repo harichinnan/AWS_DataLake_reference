@@ -165,6 +165,12 @@ data "aws_iam_policy_document" "pipeline_sfn" {
   }
 
   statement {
+    sid       = "LakeFormationDataAccess"
+    actions   = ["lakeformation:GetDataAccess"]
+    resources = ["*"]
+  }
+
+  statement {
     sid = "WriteLogs"
     actions = [
       "logs:CreateLogDelivery",
@@ -186,6 +192,33 @@ resource "aws_iam_role_policy" "pipeline_sfn" {
   name   = "${local.pipeline_state_machine_name}-policy"
   role   = aws_iam_role.pipeline_sfn[0].id
   policy = data.aws_iam_policy_document.pipeline_sfn[0].json
+}
+
+###############################################################################
+# Lake Formation grants for the state machine role (when LF governance is on)
+###############################################################################
+
+resource "aws_lakeformation_permissions" "pipeline_sfn_database" {
+  count = local.pipeline_orchestration_active && var.enable_lake_formation_governance ? 1 : 0
+
+  principal   = aws_iam_role.pipeline_sfn[0].arn
+  permissions = ["DESCRIBE"]
+
+  database {
+    name = aws_glue_catalog_database.citibike.name
+  }
+}
+
+resource "aws_lakeformation_permissions" "pipeline_sfn_tables" {
+  count = local.pipeline_orchestration_active && var.enable_lake_formation_governance ? 1 : 0
+
+  principal   = aws_iam_role.pipeline_sfn[0].arn
+  permissions = ["SELECT", "DESCRIBE", "INSERT", "DELETE", "ALTER"]
+
+  table {
+    database_name = aws_glue_catalog_database.citibike.name
+    wildcard      = true
+  }
 }
 
 ###############################################################################

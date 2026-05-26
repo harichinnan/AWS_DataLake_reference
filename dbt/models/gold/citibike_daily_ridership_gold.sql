@@ -4,10 +4,20 @@
     table_type='iceberg',
     incremental_strategy='merge',
     unique_key='trip_date',
+    unique_tmp_table_suffix=true,
     partitioned_by=['month(trip_date)'],
     on_schema_change='sync_all_columns',
     table_properties={
       'optimize_rewrite_delete_file_threshold': '2'
+    },
+    lf_tags_config={
+      'enabled': true,
+      'tags': {
+        'domain': 'trips',
+        'layer': 'gold',
+        'pii_level': 'none',
+        'freshness_tier': 'daily'
+      }
     }
   )
 }}

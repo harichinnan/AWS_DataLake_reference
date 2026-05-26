@@ -1,0 +1,34 @@
+name: dqdl-ci
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/dqdl/**'
+      - '.github/workflows/dqdl-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Render and inspect DQDL template
+        run: |
+          # The .tftpl file currently has only one substitution: ${start_date}.
+          # Render with a dummy value and check the result is non-empty and starts
+          # with `Rules =` (the canonical DQDL prefix).
+          for f in terraform/dqdl/*.dqdl.tftpl; do
+            echo "--- $f"
+            sed 's|${start_date}|2026-01-01|g' "$f" > /tmp/rendered.dqdl
+            head -1 /tmp/rendered.dqdl
+            grep -q '^Rules' /tmp/rendered.dqdl && echo "OK: contains Rules block"
+            wc -l /tmp/rendered.dqdl
+          done
+
+  # NOTE: AWS does not yet provide an offline DQDL validator. The authoritative
+  # syntax check is `aws glue update-data-quality-ruleset --dry-run` which is
+  # only available against a deployed ruleset. dqdl-cd will surface any syntax
+  # errors at publish time.

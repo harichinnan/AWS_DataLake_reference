@@ -1,0 +1,83 @@
+name: lambda-cd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/lambda/**'
+      - '.github/workflows/lambda-cd.yml'
+
+concurrency:
+  group: lambda-cd
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Map source file → deployed Lambda function name.
+        include:
+          - source: src/lambda/ingest_citibike.py
+            function: citibike-lake-dev-citibike-ingest
+            key_prefix: lambda/citibike_ingest
+          - source: src/lambda/process_glue_dq_event.py
+            function: citibike-lake-dev-glue-dq-events
+            key_prefix: lambda/glue_dq_event_processor
+          - source: src/lambda/pipeline_kicker.py
+            function: citibike-lake-dev-pipeline-kicker
+            key_prefix: lambda/pipeline_kicker
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/citibike-lake-dev-gha-pipeline
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Skip if function does not exist (optional Lambdas)
+        id: exists
+        run: |
+          if aws lambda get-function --function-name "${{ matrix.function }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Function ${{ matrix.function }} not deployed yet; skipping."
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build zip
+        if: steps.exists.outputs.exists == 'true'
+        run: |
+          SHA="${GITHUB_SHA::8}"
+          mkdir -p out
+          # Single-file Lambdas: zip just the source.
+          cd "$(dirname "${{ matrix.source }}")"
+          zip -j "${GITHUB_WORKSPACE}/out/${{ matrix.function }}-${SHA}.zip" "$(basename "${{ matrix.source }}")"
+          cd "$GITHUB_WORKSPACE"
+          ls -la "out/${{ matrix.function }}-${SHA}.zip"
+          echo "SHA=${SHA}" >> "$GITHUB_ENV"
+
+      - name: Upload to artifacts bucket
+        if: steps.exists.outputs.exists == 'true'
+        run: |
+          BUCKET="citibike-lake-dev-artifacts-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}"
+          aws s3 cp "out/${{ matrix.function }}-${SHA}.zip" \
+            "s3://${BUCKET}/${{ matrix.key_prefix }}/${SHA}.zip"
+          aws s3 cp "out/${{ matrix.function }}-${SHA}.zip" \
+            "s3://${BUCKET}/${{ matrix.key_prefix }}/latest.zip"
+
+      - name: Update Lambda function code
+        if: steps.exists.outputs.exists == 'true'
+        run: |
+          BUCKET="citibike-lake-dev-artifacts-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}"
+          aws lambda update-function-code \
+            --function-name "${{ matrix.function }}" \
+            --s3-bucket "$BUCKET" \
+            --s3-key "${{ matrix.key_prefix }}/${SHA}.zip" \
+            --publish \
+            --query '{FunctionName: FunctionName, Version: Version, LastModified: LastModified}'

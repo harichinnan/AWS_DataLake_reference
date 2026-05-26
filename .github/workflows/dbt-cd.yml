@@ -1,0 +1,46 @@
+name: dbt-cd
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'dbt/**'
+      - '.github/workflows/dbt-cd.yml'
+
+concurrency:
+  group: dbt-cd
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/citibike-lake-dev-gha-pipeline
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Build dbt project tarball
+        run: |
+          SHA="${GITHUB_SHA::8}"
+          tar czf "dbt-${SHA}.tar.gz" -C dbt .
+          ls -la "dbt-${SHA}.tar.gz"
+          echo "SHA=${SHA}" >> "$GITHUB_ENV"
+
+      - name: Resolve artifacts bucket
+        id: bucket
+        run: |
+          BUCKET="citibike-lake-dev-artifacts-${{ vars.AWS_ACCOUNT_ID }}-${{ vars.AWS_REGION }}"
+          echo "bucket=${BUCKET}" >> "$GITHUB_OUTPUT"
+          echo "Resolved artifacts bucket: ${BUCKET}"
+
+      - name: Upload versioned + latest
+        run: |
+          aws s3 cp "dbt-${SHA}.tar.gz" "s3://${{ steps.bucket.outputs.bucket }}/dbt/${SHA}.tar.gz"
+          aws s3 cp "dbt-${SHA}.tar.gz" "s3://${{ steps.bucket.outputs.bucket }}/dbt/latest.tar.gz"
