@@ -51,8 +51,8 @@ jobs:
         run: |
           aws glue update-data-quality-ruleset \
             --name "$RULESET_NAME" \
-            --description "Published by dbt-cd@${SHA}" \
-            --updated-ruleset "$(cat out/${SHA}.dqdl)"
+            --description "Published by dqdl-cd@${SHA}" \
+            --ruleset "$(cat out/${SHA}.dqdl)"
           aws glue get-data-quality-ruleset --name "$RULESET_NAME" \
             --query '{Name: Name, LastModifiedOn: LastModifiedOn, RuleSet: Ruleset}' \
             --output json | head -20
